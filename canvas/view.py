@@ -211,6 +211,33 @@ class WhiteboardView(QGraphicsView):
             return
         super().mouseDoubleClickEvent(event)
 
+    # ------------------------------------------------------------- 文件拖放
+    # 注意：`QGraphicsView` 的 acceptDrops 默认就是 True（viewport 也是），
+    # 而 Qt 只会把拖放事件发给**光标下那个接收拖放的控件**，不会再往上传给父窗口。
+    # 所以只给主窗口设 acceptDrops 是没用的 —— 拖到画布上时事件全被这里吃掉，
+    # 表现就是「拖进去毫无反应」。真正的入口必须写在这里，再由视图转给主窗口处理。
+    def dragEnterEvent(self, event) -> None:
+        if self._window_accepts_drop(event.mimeData()):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event) -> None:
+        self.dragEnterEvent(event)
+
+    def dropEvent(self, event) -> None:
+        handler = getattr(self.window(), "handle_file_drop", None)
+        if not callable(handler):
+            event.ignore()
+            return
+        # 事件坐标是视口坐标，直接换算成场景坐标交给主窗口
+        scene_pos = self.mapToScene(event.position().toPoint())
+        handler(event, scene_pos)
+
+    def _window_accepts_drop(self, mime_data) -> bool:
+        accepts = getattr(self.window(), "accepts_file_drop", None)
+        return bool(callable(accepts) and accepts(mime_data))
+
     def wheelEvent(self, event: QWheelEvent) -> None:
         if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
             super().wheelEvent(event)  # Ctrl+滚轮 = 默认（横向滚动等）

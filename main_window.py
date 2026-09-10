@@ -721,25 +721,39 @@ class MainWindow(QMainWindow):
 
     # ========================================================== 拖拽导入
     def dragEnterEvent(self, event) -> None:
-        if self._dropped_paths(event.mimeData()):
+        """窗口非画布区域（工具栏/菜单/状态栏）的拖入。
+
+        画布区域的事件由 :class:`WhiteboardView` 接住再转给
+        :meth:`handle_file_drop` —— 视图的 acceptDrops 默认是 True，
+        Qt 不会把拖放再往上传给窗口。
+        """
+        if self.accepts_file_drop(event.mimeData()):
             event.acceptProposedAction()
         else:
             event.ignore()
 
     def dragMoveEvent(self, event) -> None:
-        if self._dropped_paths(event.mimeData()):
-            event.acceptProposedAction()
-        else:
-            event.ignore()
+        self.dragEnterEvent(event)
 
     def dropEvent(self, event) -> None:
-        """拖文件进窗口：图片导入到落点，.wbd 追加为新页面。"""
+        point = event.position().toPoint()
+        scene_pos = self.view.mapToScene(self.view.mapFrom(self, point))
+        self.handle_file_drop(event, scene_pos)
+
+    def accepts_file_drop(self, mime_data) -> bool:
+        """拖进来的东西里有没有能处理的文件（供视图查询）。"""
+        return bool(self._dropped_paths(mime_data))
+
+    def handle_file_drop(self, event, scene_pos=None) -> None:
+        """真正处理拖放：图片导入到落点，.wbd 追加为新页面。
+
+        两条入口都走这里：主窗口（工具栏区域）与
+        :class:`WhiteboardView`（画布区域，真实拖拽基本都落在这里）。
+        """
         paths = self._dropped_paths(event.mimeData())
         if not paths:
             event.ignore()
             return
-        point = event.position().toPoint()
-        scene_pos = self.view.mapToScene(self.view.mapFrom(self, point))
 
         images, documents, skipped = [], [], []
         for path in paths:

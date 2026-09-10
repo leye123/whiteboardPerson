@@ -719,20 +719,36 @@ def main() -> int:
     from PySide6.QtCore import QMimeData, QUrl
     from PySide6.QtGui import QDragEnterEvent, QDropEvent
 
-    def drop_files(paths, pos=QPoint(500, 400)):
-        """模拟把文件拖进窗口，返回 (dragEnter 是否接收, drop 是否完成)。"""
+    def drop_files(paths, pos=QPoint(500, 400), target=None):
+        """模拟把文件拖进窗口，返回 (dragEnter 是否接收, drop 是否完成)。
+
+        默认发给 ``win.view``（画布）：**真实拖拽就是这样**——Qt 只会把拖放事件
+        发给光标下那个接收拖放的控件，而 QGraphicsView 的 acceptDrops 默认是
+        True，事件不会再上传给主窗口。曾经把测试写成直接发给主窗口，
+        结果真实使用完全无效（测试假通过）。
+        """
+        target = target if target is not None else win.view
         mime = QMimeData()
         mime.setUrls([QUrl.fromLocalFile(path) for path in paths])
         enter = QDragEnterEvent(pos, Qt.DropAction.CopyAction, mime,
                                 Qt.MouseButton.LeftButton,
                                 Qt.KeyboardModifier.NoModifier)
-        QApplication.sendEvent(win, enter)
+        QApplication.sendEvent(target, enter)
         drop = QDropEvent(QPointF(pos), Qt.DropAction.CopyAction, mime,
                           Qt.MouseButton.LeftButton,
                           Qt.KeyboardModifier.NoModifier)
-        QApplication.sendEvent(win, drop)
+        QApplication.sendEvent(target, drop)
         app.processEvents()
         return enter.isAccepted(), drop.isAccepted()
+
+    def drop_point_to_scene(target, pos):
+        """把落点换算成场景坐标：发给视图时事件坐标是视口坐标，
+        发给主窗口时是窗口坐标（差一个工具栏的高度）。"""
+        if target is win:
+            return win.view.mapToScene(win.view.mapFrom(win, pos))
+        return win.view.mapToScene(pos)
+
+    ok(win.view.acceptDrops(), "画布控件本身接收拖放（拖拽事件的真正入口）")
 
     scene = fresh_scene()
     drop_target = QPoint(430, 360)
@@ -745,7 +761,7 @@ def main() -> int:
     dropped_items = [it for it in scene.items() if isinstance(it, ImageItem)]
     ok(len(dropped_items) == 1, "拖入的图片被导入到当前页")
     # 落点应该就在鼠标位置附近（宽高 60x40，以落点为中心）
-    expected = win.view.mapToScene(win.view.mapFrom(win, drop_target))
+    expected = drop_point_to_scene(win.view, drop_target)
     center = dropped_items[0].scenePos() + QPointF(30.0, 20.0)
     ok(abs(center.x() - expected.x()) < 2.0 and abs(center.y() - expected.y()) < 2.0,
        f"图片落在鼠标位置（落点 {expected.x():.0f},{expected.y():.0f}，"
@@ -788,6 +804,21 @@ def main() -> int:
         handle.write("不是白板也不是图片")
     entered, _dropped = drop_files([txt_path])
     ok(not entered, "不支持的文件类型不会被接受（不弹错误）")
+
+    # 工具栏/状态栏等非画布区域：事件走主窗口自己的处理器
+    scene = fresh_scene()
+    entered, dropped = drop_files([drop_image], drop_target, target=win)
+    ok(entered and dropped, "拖到非画布区域（工具栏/状态栏）也能导入")
+    ok(len([it for it in scene.items() if isinstance(it, ImageItem)]) == 1,
+       "主窗口路径同样把图片导入当前页")
+
+    # 真实路径：Qt 把拖放投递给光标下最深那个接收拖放的控件，也就是 viewport
+    scene = fresh_scene()
+    entered, dropped = drop_files([drop_image], drop_target,
+                                  target=win.view.viewport())
+    ok(entered and dropped, "拖到画布视口（Qt 实际投递的控件）能导入")
+    ok(len([it for it in scene.items() if isinstance(it, ImageItem)]) == 1,
+       "视口路径把图片导入当前页")
 
     print(f"\n全部 {checks} 项冒烟检查通过")
     return 0
