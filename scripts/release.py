@@ -32,17 +32,19 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
+from core import paths  # noqa: E402
 from core.version import APP_TITLE, AUTHOR, PACKAGE_BASENAME, __version__, asset_name, version_tag  # noqa: E402
 
 DIST_DIR = os.path.join(ROOT, "dist")
-# 打包产物的候选目录（按顺序找）：Nuitka --onedir / PyInstaller --onedir / 单文件
+# 打包产物的候选位置（按顺序找）：PyInstaller 目录版 / Nuitka / PyInstaller 单文件
 CANDIDATE_OUTPUTS = (
-    os.path.join(ROOT, "build", "nuitka", "main.dist"),
     os.path.join(ROOT, "dist", f"{PACKAGE_BASENAME}-{__version__}"),
-    os.path.join(ROOT, "build", "nuitka"),
-    os.path.join(ROOT, "dist"),
+    os.path.join(ROOT, "build", "nuitka", "main.dist"),
+    os.path.join(ROOT, "dist", f"{PACKAGE_BASENAME}-{__version__}.exe"),
+    os.path.join(ROOT, "dist", f"{PACKAGE_BASENAME}.exe"),
 )
-EXE_NAME = f"{PACKAGE_BASENAME}.exe"
+EXE_NAME = f"{PACKAGE_BASENAME}-{__version__}.exe"
+EXE_NAME_PLAIN = f"{PACKAGE_BASENAME}.exe"
 
 
 def run(cmd: list, dry_run: bool = False, check: bool = True, capture: bool = False) -> int:
@@ -54,51 +56,72 @@ def run(cmd: list, dry_run: bool = False, check: bool = True, capture: bool = Fa
     return subprocess.call(cmd, cwd=ROOT)
 
 
-def find_output(source: str = None) -> str:
-    """找到包含 exe 的产物目录。"""
-    if source:
-        if not os.path.isdir(source):
-            raise SystemExit(f"指定的产物目录不存在：{source}")
-        return os.path.abspath(source)
-    for candidate in CANDIDATE_OUTPUTS:
-        if os.path.isdir(candidate) and find_exe(candidate):
-            return candidate
-    raise SystemExit(
-        "没找到打包产物，请先运行：python build_exe.py --nuitka --onedir\n"
-        f"（已检查：{', '.join(CANDIDATE_OUTPUTS)}）")
-
-
 def find_exe(directory: str) -> str:
-    direct = os.path.join(directory, EXE_NAME)
-    if os.path.isfile(direct):
-        return direct
+    """在产物目录里找主程序（PyInstaller/Nuitka 会命名成 <name>.exe）。"""
+    for candidate in (EXE_NAME, EXE_NAME_PLAIN):
+        path = os.path.join(directory, candidate)
+        if os.path.isfile(path):
+            return path
     for name in os.listdir(directory):
-        if name.lower() == EXE_NAME.lower():
+        lower = name.lower()
+        if lower.startswith(PACKAGE_BASENAME.lower()) and lower.endswith(".exe"):
             return os.path.join(directory, name)
     return ""
 
 
-def make_archive(source_dir: str, dry_run: bool = False) -> str:
-    """把产物目录打成 zip（保持顶层目录，解压即得一个可直接运行的文件夹）。"""
+def find_artifact(source: str = None) -> str:
+    """找到待发布的产物：目录（目录版）或单个 exe（单文件版）。"""
+    if source:
+        if not os.path.exists(source):
+            raise SystemExit(f"指定的产物不存在：{source}")
+        return os.path.abspath(source)
+    for candidate in CANDIDATE_OUTPUTS:
+        if os.path.isdir(candidate) and find_exe(candidate):
+            return candidate
+        if os.path.isfile(candidate) and candidate.lower().endswith(".exe"):
+            return candidate
+    raise SystemExit(
+        "没找到打包产物，请先运行：python build_exe.py --onedir\n"
+        f"（已检查：{', '.join(CANDIDATE_OUTPUTS)}）")
+
+
+def make_asset(source: str, dry_run: bool = False) -> str:
+    """把产物变成可直接上传的发布资产。
+
+    * 单文件 exe -> 复制为 ``dist/Whiteboard-<版本>-win64.exe``
+    * 目录       -> 压缩为 ``dist/Whiteboard-<版本>-win64.zip``
+      （主程序放在 zip 根目录并统一命名为 ``Whiteboard.exe``，解压即用）
+    """
     os.makedirs(DIST_DIR, exist_ok=True)
+
+    if os.path.isfile(source):
+        target = os.path.join(DIST_DIR, asset_name("win64.exe"))
+        if dry_run:
+            print(f"  将复制 {source} -> {target}")
+            return target
+        shutil.copy2(source, target)
+        print(f"  已生成 {target}（{os.path.getsize(target) / 1048576:.1f} MB）")
+        return target
+
     target = os.path.join(DIST_DIR, asset_name("win64.zip"))
     if dry_run:
-        print(f"  将压缩 {source_dir} -> {target}")
+        print(f"  将压缩 {source} -> {target}")
         return target
-    top = os.path.basename(os.path.normpath(source_dir))
-    root_exe = find_exe(source_dir)
+    top = os.path.basename(os.path.normpath(source))
+    root_exe = find_exe(source)
+    # 运行时产生的文件不该进发布包（验证产物时程序会在 exe 旁边写配置）
+    excluded = {paths.SETTINGS_FILENAME.lower(), paths.AUTOSAVE_FILENAME.lower()}
     with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as archive:
-        for base, _dirs, files in os.walk(source_dir):
+        for base, _dirs, files in os.walk(source):
             for name in files:
+                if name.lower() in excluded:
+                    continue
                 full = os.path.join(base, name)
-                # 顶层 exe 放进 zip 根目录，其余保持原结构
                 if os.path.normcase(full) == os.path.normcase(root_exe):
-                    arcname = os.path.relpath(full, source_dir)
+                    archive.write(full, EXE_NAME_PLAIN)      # 主程序放根目录
                 else:
-                    arcname = os.path.join(top, os.path.relpath(full, source_dir))
-                archive.write(full, arcname)
-    size_mb = os.path.getsize(target) / 1048576
-    print(f"  已生成 {target}（{size_mb:.1f} MB）")
+                    archive.write(full, os.path.join(top, os.path.relpath(full, source)))
+    print(f"  已生成 {target}（{os.path.getsize(target) / 1048576:.1f} MB）")
     return target
 
 
@@ -137,22 +160,22 @@ def main() -> int:
     tag = version_tag()
     print(f"=== 发布 {APP_TITLE} {__version__} ===")
     print(f"标签   : {tag}")
-    print(f"资产名 : {asset_name('win64.zip')}")
+    print(f"资产名 : {asset_name('win64.zip')} / {asset_name('win64.exe')}")
     print(f"仓库   : {git('remote', 'get-url', 'origin', dry_run=args.dry_run) or '(未设置 origin)'}")
     print()
 
     if not args.no_build:
         print("[1/4] 打包")
-        code = run([sys.executable, os.path.join(ROOT, "build_exe.py"), "--nuitka", "--onedir"],
+        code = run([sys.executable, os.path.join(ROOT, "build_exe.py"), "--onedir"],
                    dry_run=args.dry_run)
         if code != 0:
             return code
     else:
         print("[1/4] 跳过打包（--no-build）")
 
-    print("[2/4] 压缩发布包")
-    source_dir = find_output(args.source) if not args.dry_run else (args.source or CANDIDATE_OUTPUTS[0])
-    archive = make_archive(source_dir, dry_run=args.dry_run)
+    print("[2/4] 生成发布资产")
+    source = args.source or (find_artifact() if not args.dry_run else CANDIDATE_OUTPUTS[0])
+    archive = make_asset(source, dry_run=args.dry_run)
 
     print("[3/4] 打标签")
     existing = git("tag", "--list", tag, dry_run=args.dry_run)
@@ -163,8 +186,8 @@ def main() -> int:
         print(f"  已创建标签 {tag}（推送：git push origin {tag}）")
 
     if args.zip_only:
-        print("\n--zip-only：已生成发布包，未创建 GitHub Release。")
-        print(f"  发布包：{archive}")
+        print("\n--zip-only：已生成发布资产，未创建 GitHub Release。")
+        print(f"  发布资产：{archive}")
         print(f"  之后可执行：gh release create {tag} \"{archive}\" --title \"{tag}\"")
         return 0
 

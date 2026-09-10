@@ -106,7 +106,10 @@ def _pick_wheel(indexes, package: str, pinned: str = None):
                 name = info.get("filename", "")
                 if info.get("packagetype") != "bdist_wheel":
                     continue
-                if PLATFORM_TAG not in name or not name.endswith(".whl"):
+                if not name.endswith(".whl"):
+                    continue
+                # 二进制包带平台标签；纯 Python 包是 py3-none-any，两者都要接受
+                if PLATFORM_TAG not in name and "none-any" not in name:
                     continue
                 if not _python_ok(info.get("requires_python", "")):
                     continue
