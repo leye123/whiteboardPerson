@@ -1,15 +1,19 @@
 """打包为独立 .exe（build_exe.py）。
 
-默认使用 PyInstaller；加 ``--nuitka`` 改用 Nuitka（生成 C 代码，体积更小、启动更快）。
+默认（也是发布用的唯一形式）是 PyInstaller **单文件**版：
 
-    python build_exe.py              # PyInstaller -> dist/Whiteboard-1.1.0.exe
+    python build_exe.py              # -> dist/Whiteboard-<版本>.exe（发布用这个）
     python build_exe.py --nuitka     # Nuitka      -> build/nuitka/main.dist/
-    python build_exe.py --onedir     # 目录形式（启动更快，便于排查）
+    python build_exe.py --onedir     # 目录形式（**只用于本地排查**）
+
+为什么发布只用单文件：目录版必须在 exe 旁边带着 ``_internal`` 目录才能启动，
+一旦这两者分家（把 exe 单独放进 zip 根目录、其余文件塞进子目录）运行时就报
+DLL 缺失；单文件版把依赖都装在自己身上，没有这个问题。
 
 版本号来自 ``core/version.py``，会同时写进：
 
 * 可执行文件的 Windows 版本资源（右键属性→详细信息里能看到）；
-* 产物文件名（``Whiteboard-1.1.0.exe`` / ``Whiteboard-1.1.0-win64.zip``）；
+* 产物文件名（``Whiteboard-1.1.0.exe``）；
 * ``scripts/release.py`` 创建的 Release 标签与资产名。
 
 注意：``resources/`` 里的 QSS 是运行时读取的，必须一起打包；
@@ -229,11 +233,12 @@ def main() -> int:
     if code == 0:
         verify_icon_in_exe(exe)
         print("\n打包完成：")
-        print(f"  PyInstaller: dist/{NAME}-{VERSION}/{NAME}.exe")
-        print(f"  Nuitka:      build/nuitka/main.dist/{NAME}.exe")
+        print(f"  单文件（发布用）: dist/{NAME}-{VERSION}.exe")
+        print(f"  目录版（仅排查）: dist/{NAME}-{VERSION}/{NAME}.exe"
+              "（必须和 _internal 放在一起，别单独拷走 exe）")
         print("\n建议先跑一次路径自检，确认配置会写在 exe 旁边而不是临时目录：")
         print(f"  {NAME}.exe --paths")
-        print("\n再打开发布包（zip + GitHub Release）：")
+        print("\n再打开发布包（单文件 + GitHub Release）：")
         print("  python scripts/release.py --build")
     return code
 

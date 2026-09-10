@@ -3,8 +3,8 @@
 基于 **PySide6 / Qt Graphics View Framework** 的 Windows 个人白板应用。
 自由画笔（平滑曲线）、橡皮擦（擦断笔迹）、11 种形状（含圆角矩形与虚线线型）、
 文字（可选字体/字号/颜色/自动换行，支持导入字体）、选择/移动（含框选）、
-拖动画布、多页面、撤销重做、`.wbd` 文件保存、PNG 导出、导入图片、
-自动保存与深浅主题。
+拖动画布、图片与文字自由伸缩、多页面、撤销重做、`.wbd` 文件保存、PNG 导出、
+导入图片、**拖拽文件进窗口**、自动保存与深浅主题。
 
 ![浅色主题](docs/screenshot_light.png)
 
@@ -87,8 +87,8 @@ whiteboard/
 │   ├── check_icons.py       # 图标自检：贴边裁切/空白/被拉伸 + 生成总览图
 │   └── icon_ascii.py        # 在终端用 ASCII 点阵“看”图标（排查线条断裂）
 ├── tests/
-│   ├── test_core.py         # 35 项核心逻辑单元测试（无需 pytest）
-│   └── smoke_test.py        # 102 项端到端冒烟测试（offscreen，无需显示器）
+│   ├── test_core.py         # 核心逻辑单元测试（offscreen，无需 pytest）
+│   └── smoke_test.py        # 端到端冒烟测试（模拟真实鼠标事件驱动主窗口）
 └── docs/                    # 截图与图标总览图
 ```
 
@@ -112,6 +112,7 @@ whiteboard/
 | 删除         | 选择工具选中后按`Delete`                                                                                                                     |
 | 页面         | `Ctrl+T` 新建；`PgUp`/`PgDn` 切换；`Ctrl+Shift+D` 删除当前页                                                                                 |
 | 文件         | `Ctrl+S` 保存、`Ctrl+Shift+S` 另存为、`Ctrl+O` 打开、`Ctrl+E` 导出 PNG、`Ctrl+I` 导入图片                                                    |
+| 拖拽导入     | 把**图片**拖进窗口 → 导入到鼠标落点（自动选中，可直接拖动/缩放）；把 **`.wbd` 白板文件**拖进窗口 → 作为新页面**追加**到当前文档（不是替换）；一次可以拖多个文件 |
 | 恢复默认设置 | 「视图 → 恢复默认设置…」（清掉颜色/粗细/线型/形状/工具/主题等偏好，画布内容与导入的字体不动）                                                |
 
 ## 5. 实现要点
@@ -164,6 +165,13 @@ whiteboard/
   文字按主方向改字号（勾了自动换行时折行宽度一起缩放）。
   手柄画在**视口叠加层**（不进文件、不进导出的 PNG），命中测试在视口坐标里做，
   这样手柄的抓取范围与画布缩放无关。缩放结果通过 `ResizeItemCommand` 进撤销栈。
+- **拖拽导入**：主窗口 `setAcceptDrops(True)`，`dragEnterEvent` 只接收「认识的文件」
+  （图片扩展名或 `.wbd`，扩展名不认识时再问一句 `QImageReader.canRead()`），
+  这样拖 `.txt` 进来鼠标就会显示禁止标志。松手时图片用**落点**做中心插入
+  （`view.mapFrom(self, pos)` → `mapToScene`），`.wbd` 则走
+  `append_document_pages()`：把来源文件的页面追加到当前文档、套用当前主题、
+  切到第一页，并把文档标记为「有未保存改动」（追加页面不经过撤销栈，
+  所以 `_document_modified` 要参与 `_is_dirty()` 判断，否则标题不会出现 `*`）。
 - **文字与字体**：排版参数集中在 `core/text_format.py` 的 `TextFormat`
   （字体/字号/颜色/粗斜体/对齐/自动换行宽度），对话框、图形项、设置文件
   三处共用同一份定义。自动换行 = `QGraphicsTextItem.setTextWidth(w)`，
@@ -283,50 +291,14 @@ python scripts/cleanup.py --legacy-only    # 只清旧版遗留（注册表 + �
 手动清理：`reg delete "HKCU\Software\WhiteboardPyside" /f`，
 以及删掉 `%APPDATA%\WhiteboardPyside`。
 
-## 7. 测试
-
-```bash
-# 核心逻辑单元测试（笔画/擦除切分/形状与线型/文字排版/字体导入/缩放/序列化/撤销命令）
-python tests/test_core.py            # 35/35
-
-# 端到端冒烟测试：画笔→撤销→形状（11 种）→虚线→橡皮擦断→框选→拖动→文字排版
-#                 →导入图片→图片/文字自由伸缩→多页面→存取→导出 PNG→主题
-python tests/smoke_test.py           # 102/102
-```
-
-两个脚本都会自动使用 `QT_QPA_PLATFORM=offscreen`，无需真实显示器，
-退出码 0 表示全部通过。生成截图：
-
-```bash
-python scripts/screenshot.py --theme light
-python scripts/screenshot.py --theme dark
-```
-
-### 图标自检
-
-```bash
-python scripts/check_icons.py            # 逐图标体检 + 工具栏实测 + 生成 docs/icons.png
-set QT_SCALE_FACTOR=1.25 && python scripts/check_icons.py   # 模拟 125% 缩放屏
-python scripts/icon_ascii.py 16 pen eraser                  # 终端里 ASCII 看图标
-python scripts/icon_ascii.py 32 app                         # 应用图标（exe/窗口图标）
-python scripts/make_icon.py                                 # 重新生成 resources/icons/whiteboard.ico
-```
-
-`check_icons.py` 会检查：图标是否空白、墨迹是否贴到画布边缘（贴边=被裁切）、
-覆盖率是否过高（小尺寸糊成一团）、工具栏是否溢出（按钮被收进 “>>”）、
-工具栏控件是否被异常拉伸。在 100%/125%/150% 缩放下都应退出码为 0。
-
-应用图标（窗口图标与 exe 图标用的是同一份绘制代码）：
-
-![应用图标](docs/app_icon.png)
-
-## 8. 已知限制与后续可做
+## 7. 已知限制与后续可做
 
 - 形状（矩形/椭圆/多边形/直线/箭头）/ 文字 / 图片无法「擦断」，被橡皮碰到时整体删除；
   笔迹已经支持按橡皮圆擦断（见第 5 节的切分算法）。
 - 未填充图形（矩形/椭圆/多边形）的命中判定只认**描边**：点图形正中不会选中它，
   需要点在边线上（框选不受影响）。
-- 选择工具支持移动，暂未实现缩放/旋转控制点；导入的图片也不能拖角缩放。
+- 可自由伸缩的只有**图片**与**文字**；形状的尺寸靠重新绘制，尚未提供控制点，
+  也还没有旋转。
 - 文字暂不支持部分加粗/部分改色（整块文字共用一套排版参数）。
 - 导入的字体只在本机生效：文档里记录字体名与来源文件，换台机器打开时若字体缺失
   会退回默认字体（不会报错）。

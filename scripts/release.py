@@ -3,18 +3,24 @@
 流程：
 
 1. 调用 ``build_exe.py`` 打包（``--no-build`` 可跳过，复用已有产物）；
-2. 把构建产物目录压缩成 ``dist/Whiteboard-<版本>-win64.zip``；
+2. 把单文件产物复制成 ``dist/Whiteboard-<版本>-win64.exe``；
 3. 本地打上 ``v<版本>`` 标签；
-4. 用 GitHub CLI（``gh release create``）创建 Release 并上传压缩包。
+4. 用 GitHub CLI（``gh release create``）创建 Release 并上传。
 
 版本号取自 ``core/version.py``，所以产物名、标签、Release 标题三者永远一致。
 
+**发布只用单文件（onefile）**：目录版（``--onedir``）必须在 exe 旁边带着
+``_internal`` 目录才能启动，一旦这两者分家（例如把 exe 单独放进 zip 根目录、
+其余文件塞进子目录）运行时就报 DLL 缺失。单文件版没这个问题，所以发布资产
+只有 ``.exe`` 一个；目录版只在本地排查时用，压缩脚本
+:func:`make_debug_zip` 会保证「所有文件都在同一个顶层目录里」。
+
 用法：
-    python scripts/release.py                 # 构建 + 打包 + 建标签 + 上传
+    python scripts/release.py                 # 构建 + 生成资产 + 打标签 + 上传
     python scripts/release.py --no-build      # 复用已有产物
     python scripts/release.py --dry-run       # 只打印步骤，不执行
     python scripts/release.py --draft         # 创建草稿 Release
-    python scripts/release.py --source dist   # 指定待压缩的产物目录
+    python scripts/release.py --source dist\\Whiteboard-1.1.0.exe   # 指定产物
     python scripts/release.py --notes-file RELEASE_NOTES.md
 
 前提：安装 GitHub CLI 并登录（``gh auth login``）。
@@ -36,10 +42,8 @@ from core import paths  # noqa: E402
 from core.version import APP_TITLE, AUTHOR, PACKAGE_BASENAME, __version__, asset_name, version_tag  # noqa: E402
 
 DIST_DIR = os.path.join(ROOT, "dist")
-# 打包产物的候选位置（按顺序找）：PyInstaller 目录版 / Nuitka / PyInstaller 单文件
+# 单文件产物（发布资产）：带版本号的优先，其次是打包器默认名
 CANDIDATE_OUTPUTS = (
-    os.path.join(ROOT, "dist", f"{PACKAGE_BASENAME}-{__version__}"),
-    os.path.join(ROOT, "build", "nuitka", "main.dist"),
     os.path.join(ROOT, "dist", f"{PACKAGE_BASENAME}-{__version__}.exe"),
     os.path.join(ROOT, "dist", f"{PACKAGE_BASENAME}.exe"),
 )
@@ -70,46 +74,58 @@ def find_exe(directory: str) -> str:
 
 
 def find_artifact(source: str = None) -> str:
-    """找到待发布的产物：目录（目录版）或单个 exe（单文件版）。"""
+    """找到待发布的**单文件** exe。"""
     if source:
         if not os.path.exists(source):
             raise SystemExit(f"指定的产物不存在：{source}")
         return os.path.abspath(source)
     for candidate in CANDIDATE_OUTPUTS:
-        if os.path.isdir(candidate) and find_exe(candidate):
+        if os.path.isfile(candidate):
             return candidate
-        if os.path.isfile(candidate) and candidate.lower().endswith(".exe"):
-            return candidate
+    onedir = os.path.join(ROOT, "dist", f"{PACKAGE_BASENAME}-{__version__}")
+    hint = ""
+    if os.path.isdir(onedir):
+        hint = ("\n（检测到目录版产物，但发布只用单文件：目录版缺 _internal 会报 DLL 缺失。"
+                f"\n  它只用于本地调试，压缩请用 --source \"{onedir}\"）")
     raise SystemExit(
-        "没找到打包产物，请先运行：python build_exe.py --onedir\n"
-        f"（已检查：{', '.join(CANDIDATE_OUTPUTS)}）")
+        "没找到单文件产物，请先运行：python build_exe.py"
+        f"\n（已检查：{', '.join(CANDIDATE_OUTPUTS)}）{hint}")
 
 
 def make_asset(source: str, dry_run: bool = False) -> str:
-    """把产物变成可直接上传的发布资产。
+    """把单文件产物变成发布资产：``dist/Whiteboard-<版本>-win64.exe``。
 
-    * 单文件 exe -> 复制为 ``dist/Whiteboard-<版本>-win64.exe``
-    * 目录       -> 压缩为 ``dist/Whiteboard-<版本>-win64.zip``
-      （主程序放在 zip 根目录并统一命名为 ``Whiteboard.exe``，解压即用）
+    传进来的是目录（``--onedir`` 的产物）时，只做「本地排查用的 zip」，
+    不会当成发布资产 —— 发布一律用单文件版。
     """
     os.makedirs(DIST_DIR, exist_ok=True)
 
-    if os.path.isfile(source):
-        target = os.path.join(DIST_DIR, asset_name("win64.exe"))
-        if dry_run:
-            print(f"  将复制 {source} -> {target}")
-            return target
-        shutil.copy2(source, target)
-        print(f"  已生成 {target}（{os.path.getsize(target) / 1048576:.1f} MB）")
-        return target
+    if os.path.isdir(source):
+        print("  注意：目录版不作为发布资产（发布用单文件 python build_exe.py）")
+        return make_debug_zip(source, dry_run)
 
-    target = os.path.join(DIST_DIR, asset_name("win64.zip"))
+    target = os.path.join(DIST_DIR, asset_name("win64.exe"))
+    if dry_run:
+        print(f"  将复制 {source} -> {target}")
+        return target
+    shutil.copy2(source, target)
+    print(f"  已生成 {target}（{os.path.getsize(target) / 1048576:.1f} MB）")
+    return target
+
+
+def make_debug_zip(source: str, dry_run: bool = False) -> str:
+    """把目录版压成 zip，**仅供本地排查**。
+
+    关键：所有文件必须放在**同一个顶层目录**里。PyInstaller 的目录版 exe 会到
+    自己旁边找 ``_internal``；如果把 exe 单独放到 zip 根目录、其余文件塞进子目录，
+    解压后运行就会报 DLL 缺失（发布过的旧包正是这么坏的）。
+    """
+    target = os.path.join(DIST_DIR, f"{PACKAGE_BASENAME}-{__version__}-debug.zip")
     if dry_run:
         print(f"  将压缩 {source} -> {target}")
         return target
     top = os.path.basename(os.path.normpath(source))
-    root_exe = find_exe(source)
-    # 运行时产生的文件不该进发布包（验证产物时程序会在 exe 旁边写配置）
+    # 运行时产生的文件不该进压缩包（验证产物时程序会在 exe 旁边写配置）
     excluded = {paths.SETTINGS_FILENAME.lower(), paths.AUTOSAVE_FILENAME.lower()}
     with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as archive:
         for base, _dirs, files in os.walk(source):
@@ -117,11 +133,9 @@ def make_asset(source: str, dry_run: bool = False) -> str:
                 if name.lower() in excluded:
                     continue
                 full = os.path.join(base, name)
-                if os.path.normcase(full) == os.path.normcase(root_exe):
-                    archive.write(full, EXE_NAME_PLAIN)      # 主程序放根目录
-                else:
-                    archive.write(full, os.path.join(top, os.path.relpath(full, source)))
-    print(f"  已生成 {target}（{os.path.getsize(target) / 1048576:.1f} MB）")
+                archive.write(full, os.path.join(top, os.path.relpath(full, source)))
+    print(f"  已生成 {target}（{os.path.getsize(target) / 1048576:.1f} MB，"
+          f"解压后所有文件都在 {top}/ 里）")
     return target
 
 
@@ -179,13 +193,13 @@ def main() -> int:
     tag = version_tag()
     print(f"=== 发布 {APP_TITLE} {__version__} ===")
     print(f"标签   : {tag}")
-    print(f"资产名 : {asset_name('win64.zip')} / {asset_name('win64.exe')}")
+    print(f"资产名 : {asset_name('win64.exe')}（发布只用单文件版）")
     print(f"仓库   : {git('remote', 'get-url', 'origin', dry_run=args.dry_run) or '(未设置 origin)'}")
     print()
 
     if not args.no_build:
-        print("[1/4] 打包")
-        code = run([sys.executable, os.path.join(ROOT, "build_exe.py"), "--onedir"],
+        print("[1/4] 打包（单文件）")
+        code = run([sys.executable, os.path.join(ROOT, "build_exe.py")],
                    dry_run=args.dry_run)
         if code != 0:
             return code

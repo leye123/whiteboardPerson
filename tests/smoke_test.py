@@ -715,6 +715,80 @@ def main() -> int:
         drawn += 1 if found else 0
     ok(drawn >= 6, f"缩放手柄真的画在视口上（识别到 {drawn}/8 个）")
 
+    # ---- 19. 拖拽导入：图片 -> 落在鼠标位置；.wbd -> 追加为新页面
+    from PySide6.QtCore import QMimeData, QUrl
+    from PySide6.QtGui import QDragEnterEvent, QDropEvent
+
+    def drop_files(paths, pos=QPoint(500, 400)):
+        """模拟把文件拖进窗口，返回 (dragEnter 是否接收, drop 是否完成)。"""
+        mime = QMimeData()
+        mime.setUrls([QUrl.fromLocalFile(path) for path in paths])
+        enter = QDragEnterEvent(pos, Qt.DropAction.CopyAction, mime,
+                                Qt.MouseButton.LeftButton,
+                                Qt.KeyboardModifier.NoModifier)
+        QApplication.sendEvent(win, enter)
+        drop = QDropEvent(QPointF(pos), Qt.DropAction.CopyAction, mime,
+                          Qt.MouseButton.LeftButton,
+                          Qt.KeyboardModifier.NoModifier)
+        QApplication.sendEvent(win, drop)
+        app.processEvents()
+        return enter.isAccepted(), drop.isAccepted()
+
+    scene = fresh_scene()
+    drop_target = QPoint(430, 360)
+    drop_image = os.path.join(_tmp, "dropped.png")
+    canvas_image = QImage(60, 40, QImage.Format.Format_ARGB32)
+    canvas_image.fill(QColor("#7a4fd0"))
+    canvas_image.save(drop_image)
+    entered, dropped = drop_files([drop_image], drop_target)
+    ok(entered and dropped, "拖动图片进窗口被接受")
+    dropped_items = [it for it in scene.items() if isinstance(it, ImageItem)]
+    ok(len(dropped_items) == 1, "拖入的图片被导入到当前页")
+    # 落点应该就在鼠标位置附近（宽高 60x40，以落点为中心）
+    expected = win.view.mapToScene(win.view.mapFrom(win, drop_target))
+    center = dropped_items[0].scenePos() + QPointF(30.0, 20.0)
+    ok(abs(center.x() - expected.x()) < 2.0 and abs(center.y() - expected.y()) < 2.0,
+       f"图片落在鼠标位置（落点 {expected.x():.0f},{expected.y():.0f}，"
+       f"图片中心 {center.x():.0f},{center.y():.0f}）")
+    ok(dropped_items[0].isSelected(), "拖入的图片自动选中，可以直接拖动/缩放")
+
+    # .wbd 拖进窗口 = 追加为新页面（不是替换当前文档）
+    from core.page import BoardPage
+    from persistence import file_handler as fh_module
+
+    source_doc = os.path.join(_tmp, "dragged_doc.wbd")
+    source_pages = [BoardPage("来源页 1"), BoardPage("来源页 2")]
+    source_pages[0].scene.addItem(
+        RectItem(QRectF(0.0, 0.0, 60.0, 40.0), QColor(0, 0, 0), 2.0))
+    fh_module.save_document(source_doc, source_pages, 0)
+
+    pages_before = len(win.pages)
+    items_before = page_counts(win)[0]
+    entered, dropped = drop_files([source_doc])
+    ok(entered and dropped, "拖动 .wbd 文件进窗口被接受")
+    ok(len(win.pages) == pages_before + 2,
+       f"追加为新页面（{pages_before} -> {len(win.pages)}）")
+    ok(page_counts(win)[0] == items_before, "原来的页面内容没被替换")
+    ok(win.page_index == pages_before, "视图已切到刚追加的第一页")
+    ok("dragged_doc.wbd" in win.current_page.name,
+       f"新页面名字带来源文件名（{win.current_page.name}）")
+    ok(win.current_page.item_count() == 1, "新页面上带着来源文件里的内容")
+    ok("*" in win.windowTitle(), "追加页面后文档被标记为有未保存改动")
+
+    # 一次拖多个文件（图片 + .wbd）与不支持的类型
+    fresh_scene()
+    win.pages = [win.pages[win.page_index]]     # 只留当前页，方便数数量
+    win.page_index = 0
+    win._document_modified = False
+    entered, dropped = drop_files([drop_image, source_doc])
+    ok(entered and dropped and len(win.pages) == 3,
+       f"一次拖入图片 + .wbd 都能处理（现在 {len(win.pages)} 页）")
+    txt_path = os.path.join(_tmp, "not_supported.txt")
+    with open(txt_path, "w", encoding="utf-8") as handle:
+        handle.write("不是白板也不是图片")
+    entered, _dropped = drop_files([txt_path])
+    ok(not entered, "不支持的文件类型不会被接受（不弹错误）")
+
     print(f"\n全部 {checks} 项冒烟检查通过")
     return 0
 

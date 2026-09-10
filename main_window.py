@@ -79,6 +79,12 @@ TOOL_TIPS = {
     "text": "文字：点击画布输入文字；可设字体、字号、颜色、自动换行，也能导入字体",
 }
 
+# 可以把图片拖进窗口导入的扩展名（能不能解码交给 QImageReader 判断）
+IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".bmp", ".webp", ".gif",
+                  ".tif", ".tiff", ".svg", ".ico")
+IMAGE_FILE_FILTER = ("图片 (*.png *.jpg *.jpeg *.bmp *.webp *.gif *.tif *.tiff "
+                     "*.svg *.ico);;所有文件 (*)")
+
 
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
@@ -93,6 +99,9 @@ class MainWindow(QMainWindow):
         self.pages: list[BoardPage] = [BoardPage("页面 1")]
         self.page_index = 0
         self.current_file = None
+        # 追加页面（拖入 .wbd）这类「不进撤销栈但改了文档」的操作会置位
+        self._document_modified = False
+        self.setAcceptDrops(True)          # 支持把图片 / .wbd 拖进窗口
 
         # ---------------------------------------------------------- 画布
         self.view = WhiteboardView(self.pages[0].scene, self)
@@ -483,6 +492,8 @@ class MainWindow(QMainWindow):
 
     def _is_dirty(self) -> bool:
         """只要任意一页有未保存改动，整个文档就算脏。"""
+        if getattr(self, "_document_modified", False):
+            return True                      # 例如「拖入 .wbd 追加为新页面」
         for page in getattr(self, "pages", None) or []:
             stack = page.undo_stack
             if isValid(stack) and not stack.isClean():
@@ -490,6 +501,7 @@ class MainWindow(QMainWindow):
         return False
 
     def _mark_clean(self) -> None:
+        self._document_modified = False
         for page in self.pages:
             if isValid(page.undo_stack):
                 page.undo_stack.setClean()
@@ -522,6 +534,7 @@ class MainWindow(QMainWindow):
         if not self._confirm_discard():
             return
         self.current_file = None
+        self._document_modified = False
         self.pages = [BoardPage("页面 1")]
         self.page_index = 0
         self._bind_page(self.pages[0])
@@ -543,6 +556,7 @@ class MainWindow(QMainWindow):
         self.pages = pages
         self.page_index = current
         self.current_file = path
+        self._document_modified = False
         self._bind_pages(pages)
         self._reload_view_for_pages()
         fh.clear_autosave()
@@ -637,30 +651,41 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "导出失败", "PNG 写入失败")
 
     def import_image(self) -> None:
-        """把图片文件作为图形项插入到视图中心。
+        """弹文件对话框导入图片（放到视图中心）。"""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "导入图片", fh.default_directory(),
+            IMAGE_FILE_FILTER)
+        if not path:
+            return
+        self.import_image_path(path)
+
+    def import_image_path(self, path: str, scene_pos: QPointF = None,
+                          silent: bool = False) -> bool:
+        """把一张图片作为图形项插入当前页。
+
+        :param path: 图片文件路径
+        :param scene_pos: 插入位置（场景坐标）；默认放在视图中心
+        :param silent: 为 True 时不弹提示框（拖拽导入时用状态栏反馈即可）
+        :return: 是否成功
 
         踩过的坑：``QGraphicsView.mapToScene()`` **没有 QPointF 重载**，
         传浮点坐标会抛 ``TypeError``（而且异常发生在 Qt 槽函数里，
         界面上只是「点了没反应」）。这里统一用 ``mapToScene(QPoint)`` /
         ``mapToScene(QRect)``。
         """
-        path, _ = QFileDialog.getOpenFileName(
-            self, "导入图片", fh.default_directory(),
-            "图片 (*.png *.jpg *.jpeg *.bmp *.webp *.gif *.tif *.tiff *.svg);;"
-            "所有文件 (*)")
-        if not path:
-            return
-
         # 用 QImageReader 而不是 QPixmap(path)：失败时能拿到具体原因，
         # 并且 setAutoTransform 会按 EXIF 方向把竖拍照片摆正。
         reader = QImageReader(path)
         reader.setAutoTransform(True)
         image = reader.read()
         if image.isNull():
-            QMessageBox.warning(
-                self, "导入失败",
-                f"无法读取该图片文件：\n{path}\n\n原因：{reader.errorString()}")
-            return
+            message = f"无法读取该图片文件：\n{path}\n\n原因：{reader.errorString()}"
+            if silent:
+                self.statusBar().showMessage(
+                    f"导入失败：{os.path.basename(path)}（{reader.errorString()}）", 5000)
+            else:
+                QMessageBox.warning(self, "导入失败", message)
+            return False
         pixmap = QPixmap.fromImage(image)
 
         # 太大的图缩到视图的 80%，否则一张照片会盖住整个画布
@@ -676,18 +701,129 @@ class MainWindow(QMainWindow):
             scaled = True
 
         item = ImageItem(pixmap)
-        center = view.mapToScene(view.viewport().rect().center())
+        if scene_pos is None:
+            center = view.mapToScene(view.viewport().rect().center())
+        else:
+            # 拖拽导入：以鼠标落点为中心（图片跟着鼠标走，符合直觉）
+            center = QPointF(scene_pos)
         bounds = item.boundingRect()
         item.setPos(center - QPointF(bounds.width() / 2.0, bounds.height() / 2.0))
 
         scene = view.scene()
         scene.clearSelection()
-        item.setSelected(True)              # 导入后直接选中，方便马上拖动
+        item.setSelected(True)              # 导入后直接选中，方便马上拖动/缩放
         self.undo_stack.push(AddItemCommand(scene, item, "导入图片"))
         message = f"已导入：{os.path.basename(path)}（{pixmap.width()}×{pixmap.height()}）"
         if scaled:
             message += "，已按视图大小缩放"
         self.statusBar().showMessage(message, 4000)
+        return True
+
+    # ========================================================== 拖拽导入
+    def dragEnterEvent(self, event) -> None:
+        if self._dropped_paths(event.mimeData()):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event) -> None:
+        if self._dropped_paths(event.mimeData()):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event) -> None:
+        """拖文件进窗口：图片导入到落点，.wbd 追加为新页面。"""
+        paths = self._dropped_paths(event.mimeData())
+        if not paths:
+            event.ignore()
+            return
+        point = event.position().toPoint()
+        scene_pos = self.view.mapToScene(self.view.mapFrom(self, point))
+
+        images, documents, skipped = [], [], []
+        for path in paths:
+            suffix = os.path.splitext(path)[1].lower()
+            if suffix in IMAGE_SUFFIXES:
+                images.append(path)
+            elif suffix == fh.FILE_EXT:
+                documents.append(path)
+            else:
+                skipped.append(path)
+
+        imported = []
+        for path in images:
+            if self.import_image_path(path, scene_pos, silent=True):
+                imported.append(os.path.basename(path))
+        added_pages = 0
+        for path in documents:
+            added_pages += self.append_document_pages(path)
+
+        parts = []
+        if imported:
+            parts.append(f"导入图片 {len(imported)} 张")
+        if added_pages:
+            parts.append(f"追加 {added_pages} 个页面")
+        if parts:
+            self.statusBar().showMessage("拖入完成：" + "、".join(parts), 5000)
+        elif skipped:
+            self.statusBar().showMessage(
+                f"不支持的文件类型：{os.path.basename(skipped[0])}", 5000)
+        event.acceptProposedAction()
+
+    @staticmethod
+    def _is_supported_drop(path: str) -> bool:
+        """拖进来的文件能不能处理：白板文件、常见图片扩展名，
+        或者扩展名不认识但 Qt 真的能解码（例如 .jfif/.tga）。"""
+        suffix = os.path.splitext(path)[1].lower()
+        if suffix == fh.FILE_EXT or suffix in IMAGE_SUFFIXES:
+            return True
+        return QImageReader(path).canRead()
+
+    @classmethod
+    def _dropped_paths(cls, mime_data) -> list:
+        """从拖拽数据里取出可处理的本地文件路径。
+
+        只保留「认识的文件」：这样拖一个 .txt 进来时鼠标会显示禁止标志，
+        而不是松手之后没反应。
+        """
+        if mime_data is None or not mime_data.hasUrls():
+            return []
+        paths = []
+        for url in mime_data.urls():
+            local = url.toLocalFile()
+            if local and os.path.isfile(local) and cls._is_supported_drop(local):
+                paths.append(local)
+        return paths
+
+    def append_document_pages(self, path: str) -> int:
+        """把另一个 .wbd 文件的页面**追加**到当前文档（而不是替换）。
+
+        返回追加的页面数；文件非法时提示并返回 0。
+        """
+        try:
+            pages, _current = fh.load_document(path)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "无法导入",
+                                f"这个白板文件读不出来：\n{path}\n\n{exc}")
+            return 0
+        if not pages:
+            return 0
+        # 新页面要套用当前主题（否则深色模式下会插进来一页白底）
+        self._theme_pages(pages)
+        start = len(self.pages)
+        for offset, page in enumerate(pages):
+            page.name = f"{page.name}（{os.path.basename(path)}）"
+            self.pages.append(page)
+            self._bind_page(page)
+        # 追加页面不经过撤销栈，但文档确实变了：记成「有未保存改动」
+        self._document_modified = True
+        self._switch_page(start)
+        self._update_title()
+        self.statusBar().showMessage(
+            f"已把 {os.path.basename(path)} 作为 {len(pages)} 个新页面导入", 5000)
+        return len(pages)
+
 
     # ========================================================== 编辑操作
     def delete_selected(self) -> None:
@@ -909,4 +1045,6 @@ class MainWindow(QMainWindow):
             "PgUp/PgDn 切换页面 · Delete 删除选中\n"
             "+ / - 缩放 · Ctrl+0 适应窗口 · Ctrl+1 实际大小\n"
             "空格/中键拖拽 = 平移画布\n\n"
-            "选择工具下双击文字 = 编辑内容与字体/字号/换行")
+            "选择工具下双击文字 = 编辑内容与字体/字号/换行\n"
+            "选中图片/文字后拖手柄 = 自由伸缩\n\n"
+            "把图片拖进窗口 = 导入到落点；把 .wbd 拖进窗口 = 追加为新页面")
