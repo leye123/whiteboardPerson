@@ -128,7 +128,7 @@ def build_pyinstaller(onedir: bool, clean: bool) -> int:
     return _run(cmd)
 
 
-def build_nuitka(onedir: bool, clean: bool) -> int:
+def build_nuitka(onedir: bool, clean: bool, no_lto: bool = False) -> int:
     if not _check_tool("nuitka", "nuitka", "nuitka"):
         return 1
     four = windows_version_tuple()
@@ -148,6 +148,10 @@ def build_nuitka(onedir: bool, clean: bool) -> int:
         f"--product-version={four}",
         f"--copyright={AUTHOR}",
     ]
+    if no_lto:
+        # LTO 是打包里最慢的一环（PySide6 工程可能要几十分钟），
+        # 调试/日常打包时关掉能快很多，代价是生成代码略大略慢
+        cmd.append("--lto=no")
     if not onedir:
         cmd.append("--onefile")
     else:
@@ -163,6 +167,8 @@ def main() -> int:
     parser.add_argument("--nuitka", action="store_true", help="使用 Nuitka 而不是 PyInstaller")
     parser.add_argument("--onedir", action="store_true", help="目录形式（非单文件）")
     parser.add_argument("--clean", action="store_true", help="打包前清理缓存")
+    parser.add_argument("--no-lto", action="store_true",
+                        help="Nuitka 跳过 LTO（打包快很多，产物略大）")
     args = parser.parse_args()
 
     print(f"解释器: {sys.executable}")
@@ -176,7 +182,7 @@ def main() -> int:
         print("PySide6: 未安装（当前解释器）")
 
     if args.nuitka:
-        code = build_nuitka(args.onedir, args.clean)
+        code = build_nuitka(args.onedir, args.clean, args.no_lto)
     else:
         code = build_pyinstaller(args.onedir, args.clean)
 
