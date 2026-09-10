@@ -1,0 +1,6 @@
+# 运行依赖（仅 PySide6 官方绑定）
+PySide6>=6.5
+
+# 打包（可选，二选一）
+# pyinstaller>=6.0
+# nuitka>=2.0

@@ -1,0 +1,46 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# ---- 虚拟环境 ----
+.venv/
+venv/
+env/
+
+# ---- 构建产物 ----
+build/
+dist/
+*.spec
+*.dist/
+*.build/
+*.onefile-build/
+wheels/
+.test_tmp/
+.tmp/
+
+# 打包出来的可执行文件（在发布页提供，不进版本库）
+*.exe
+!tests/**/*.exe
+
+# ---- 编辑器 / 系统 ----
+.idea/
+.vscode/
+*.swp
+Thumbs.db
+desktop.ini
+
+# ---- 白板文档与导出 ----
+*.wbd
+!tests/**/*.wbd
+*.png
+!docs/*.png
+!resources/**/*.png
+
+# ---- 便携配置（随程序目录生成，不应提交）----
+whiteboard.ini
+
+# ---- 本地开发笔记（不随仓库发布）----
+DEVELOPMENT.md
