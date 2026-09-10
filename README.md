@@ -155,12 +155,20 @@ autosave.wbd        ← 自动备份
 
 ### 打包
 
+推荐 **PyInstaller**（不需要 C 编译器，几分钟出包）：
+
 ```powershell
-python -m pip install nuitka             # 或 pyinstaller
-python build_exe.py --nuitka --onedir    # Nuitka：build/nuitka/main.dist/Whiteboard.exe
-python build_exe.py --nuitka             # Nuitka 单文件
-python build_exe.py                      # PyInstaller：dist/Whiteboard-1.0.0/
-python build_exe.py --clean              # 打包前清理中间产物
+python -m pip install pyinstaller
+python build_exe.py --onedir             # -> dist/Whiteboard-1.0.0/（启动快，推荐发布用）
+python build_exe.py                      # -> dist/Whiteboard-1.0.0.exe（单文件，便于分发）
+```
+
+也可以用 **Nuitka**（编译成 C，产物更小、启动更快，但要装编译器且**首次编译很慢**）：
+
+```powershell
+python -m pip install nuitka
+python build_exe.py --nuitka --onedir --no-lto   # --no-lto 可显著缩短打包时间
+python build_exe.py --nuitka                     # 单文件
 ```
 
 打包完成后建议先自检，确认配置会写在 exe 旁边而不是临时解包目录：
@@ -172,17 +180,22 @@ Whiteboard.exe --paths
 ### 一键发布到 GitHub Release
 
 ```powershell
-python scripts/release.py              # 打包 + 生成 zip + 建标签 + 上传 Release
-python scripts/release.py --no-build   # 复用已有产物，只做 zip 与上传
-python scripts/release.py --dry-run    # 只显示将要执行的步骤
+python scripts/release.py                 # 打包 + 生成发布资产 + 建标签 + 上传 Release
+python scripts/release.py --no-build      # 复用已有产物，只做资产与上传
+python scripts/release.py --zip-only      # 只生成发布资产，不碰 GitHub
+python scripts/release.py --source dist\Whiteboard-1.0.0   # 指定要打包的产物
+python scripts/release.py --draft         # 建草稿 Release
+python scripts/release.py --dry-run       # 只显示将要执行的步骤
 ```
 
 脚本会
 
-1. 调用 `build_exe.py` 构建（除非 `--no-build`）；
-2. 把构建目录打成 `Whiteboard-1.0.0-win64.zip`（输出到 `dist/`）；
-3. 用 `gh release create v1.0.0` 创建 Release 并上传该 zip；
-4. 打印 Release 链接。
+1. 调用 `build_exe.py --onedir` 构建（除非 `--no-build`）；
+2. 生成发布资产（输出到 `dist/`）：
+   * 目录版 → `Whiteboard-1.0.0-win64.zip`（解压即用）；
+   * 单文件版 → `Whiteboard-1.0.0-win64.exe`；
+3. 打上 `v1.0.0` 标签；
+4. 用 `gh release create` 创建 Release 并上传资产。
 
 前提：安装了 [GitHub CLI](https://cli.github.com/) 并已登录（`gh auth login`）。
 没有 gh 也可以手工做：
@@ -190,7 +203,8 @@ python scripts/release.py --dry-run    # 只显示将要执行的步骤
 ```powershell
 git tag v1.0.0
 git push origin main --tags
-gh release create v1.0.0 "dist\Whiteboard-1.0.0-win64.zip" --title "v1.0.0" --notes "首个版本"
+gh release create v1.0.0 "dist\Whiteboard-1.0.0-win64.zip" "dist\Whiteboard-1.0.0-win64.exe" `
+  --title "v1.0.0" --notes-file docs\RELEASE_NOTES_v1.0.0.md
 ```
 
 ---
