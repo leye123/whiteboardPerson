@@ -20,7 +20,7 @@
     python scripts/release.py --no-build      # 复用已有产物
     python scripts/release.py --dry-run       # 只打印步骤，不执行
     python scripts/release.py --draft         # 创建草稿 Release
-    python scripts/release.py --source dist\\Whiteboard-1.1.0.exe   # 指定产物
+    python scripts/release.py --source dist\\Whiteboard-1.2.0.exe   # 指定产物
     python scripts/release.py --notes-file RELEASE_NOTES.md
 
 前提：安装 GitHub CLI 并登录（``gh auth login``）。

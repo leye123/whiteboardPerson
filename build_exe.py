@@ -13,7 +13,7 @@ DLL 缺失；单文件版把依赖都装在自己身上，没有这个问题。
 版本号来自 ``core/version.py``，会同时写进：
 
 * 可执行文件的 Windows 版本资源（右键属性→详细信息里能看到）；
-* 产物文件名（``Whiteboard-1.1.0.exe``）；
+* 产物文件名（``Whiteboard-1.2.0.exe``）；
 * ``scripts/release.py`` 创建的 Release 标签与资产名。
 
 注意：``resources/`` 里的 QSS 是运行时读取的，必须一起打包；

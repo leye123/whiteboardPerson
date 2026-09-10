@@ -5,13 +5,13 @@
 
 发新版本时的步骤：
 1. 改这里的 ``__version__``；
-2. 提交（``git commit -m "release: v1.1.0"``）；
-3. 打标签 ``git tag v1.1.0`` 并推送；
+2. 提交（``git commit -m "release: v1.2.0"``）；
+3. 打标签 ``git tag v1.2.0`` 并推送；
 4. ``python scripts/release.py``（自动打包 + 创建 GitHub Release 并上传产物）。
 """
 from __future__ import annotations
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 APP_TITLE = "我的白板"
 APP_TITLE_EN = "Whiteboard"
