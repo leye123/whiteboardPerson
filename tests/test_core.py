@@ -943,6 +943,59 @@ def test_text_dialog_widgets_drive_the_format():
     dialog.close()
 
 
+def test_pen_stroke_line_style_and_eraser_keeps_it():
+    """画笔笔迹的线型要能存下来，擦断后碎片也要保持（曾经擦一下虚线就变实线）。"""
+    from canvas.items import line_style_name
+    from tools.eraser_tool import EraserTool
+
+    points = [QPointF(float(index), 0.0) for index in range(11)]
+    item = StrokeItem(points, QColor(0, 0, 0), 2.0, line_style="dot")
+    assert line_style_name(item.pen().style()) == "dot"
+
+    clone = _roundtrip(item)
+    assert clone.to_dict()["line_style"] == "dot"
+    assert line_style_name(clone.pen().style()) == "dot"
+
+    # 旧文件里没有 line_style 字段 -> 退回实线（不能读出错）
+    legacy = StrokeItem.from_dict({
+        "type": "stroke", "color": [0, 0, 0, 255], "thickness": 2.0,
+        "points": [[0.0, 0.0], [4.0, 4.0]]})
+    assert line_style_name(legacy.pen().style()) == "solid"
+
+    # 橡皮擦擦断：碎片继承颜色/线宽/线型
+    scene = WhiteboardScene()
+    scene.addItem(item)
+    tool = EraserTool()
+    tool._split_stroke(item, QPointF(5.0, 0.0), 1.5, scene)
+    assert len(tool._added) == 2, "擦中间应当断成两段"
+    for segment in tool._added:
+        assert line_style_name(segment.pen().style()) == "dot"
+        assert segment.pen().widthF() == 2.0
+
+    # 真的画出来验一眼：水平虚线的中心扫描线应当断成多段，实线只有一段
+    # 注意 option 不能传 None：StrokeItem 用的是 Qt 自带的 paint()，
+    # 它会读取 option->state（空指针会直接崩掉进程）。
+    from PySide6.QtWidgets import QStyleOptionGraphicsItem
+
+    def runs_on_center_row(stroke) -> int:
+        image = QImage(160, 30, QImage.Format.Format_ARGB32)
+        image.fill(QColor(255, 255, 255))
+        painter = QPainter(image)
+        painter.translate(10, 15)
+        stroke.paint(painter, QStyleOptionGraphicsItem(), None)
+        painter.end()
+        row = [image.pixelColor(x, 15).lightness() < 200
+               for x in range(image.width())]
+        return sum(1 for index, value in enumerate(row)
+                   if value and (index == 0 or not row[index - 1]))
+
+    horizontal = [QPointF(float(index) * 10.0, 0.0) for index in range(14)]
+    assert runs_on_center_row(
+        StrokeItem(horizontal, QColor(0, 0, 0), 2.0)) == 1
+    assert runs_on_center_row(
+        StrokeItem(horizontal, QColor(0, 0, 0), 2.0, line_style="dash")) >= 4
+
+
 # ------------------------------------------------------------------ 运行器
 
 

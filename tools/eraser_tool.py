@@ -28,6 +28,7 @@ from canvas.items import (
     StrokeItem,
     TextItem,
     is_preview,
+    line_style_name,
 )
 from core.history import ReplaceItemsCommand
 from core.stroke import split_by_eraser
@@ -129,7 +130,9 @@ class EraserTool(BaseTool):
         origin = QPointF(item.pos())
         self._remove(item, scene)
         for run in segments:
-            segment = StrokeItem(run, pen.color(), pen.widthF(), pos=origin)
+            # 碎片要继承原笔迹的颜色/线宽/线型，否则擦一下虚线会变成实线
+            segment = StrokeItem(run, pen.color(), pen.widthF(), pos=origin,
+                                 line_style=line_style_name(pen.style()))
             scene.addItem(segment)
             self._added.append(segment)
 

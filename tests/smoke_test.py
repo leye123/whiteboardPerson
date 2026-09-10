@@ -527,6 +527,29 @@ def main() -> int:
     win.line_style_picker.set_current("solid")
     ok(win.tools["round_rect"].line_style == "solid", "线型可以切回实线")
 
+    # ---- 15b. 画笔也遵循线型（曾经选了虚线/点线，画出来依然是实线）
+    scene = fresh_scene()
+    win.set_active_tool("pen")
+    win.line_style_picker.set_current("dash")
+    app.processEvents()
+    ok(win.tools["pen"].line_style == "dash", "线型同步到画笔工具")
+    drag(vp, QPoint(200, 200),
+         [QPoint(230, 220), QPoint(260, 235), QPoint(290, 243),
+          QPoint(320, 250), QPoint(350, 256), QPoint(380, 260)])
+    app.processEvents()
+    strokes = [it for it in scene.items() if isinstance(it, StrokeItem)]
+    ok(len(strokes) == 1 and strokes[0].to_dict()["line_style"] == "dash",
+       "画笔笔迹按所选线型（虚线）绘制")
+
+    win.set_active_tool("eraser")
+    click(vp, QPoint(290, 243))              # 落在笔迹中段的采样点上
+    app.processEvents()
+    fragments = [it for it in scene.items() if isinstance(it, StrokeItem)]
+    ok(len(fragments) == 2
+       and all(it.to_dict()["line_style"] == "dash" for it in fragments),
+       f"擦断后的笔迹碎片保持虚线（{len(fragments)} 段）")
+    win.line_style_picker.set_current("solid")
+
     # ---- 16. 文字：字体 / 字号 / 颜色 / 粗斜体 / 自动换行 + 双击编辑
     scene = fresh_scene()
     sample = TextFormat(family="Consolas", pixel_size=28, color=QColor("#c0392b"),

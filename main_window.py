@@ -74,6 +74,7 @@ RESOURCE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "resourc
 TOOL_TIPS = {
     "selector": "选择/移动：点击选中、Ctrl 多选、空白处拖拽框选、双击文字可编辑",
     "pan": "拖动画布：按住左键拖动（也可用空格+左键或中键拖拽）",
+    "pen": "画笔：自由手绘（线宽随「粗细」、线型随「线型」）",
     "eraser": "橡皮擦：擦掉经过的笔迹片段；范围随「粗细」变化",
     "text": "文字：点击画布输入文字；可设字体、字号、颜色、自动换行，也能导入字体",
 }
@@ -435,18 +436,20 @@ class MainWindow(QMainWindow):
         # （在文字对话框里设置，并记在设置文件中）。
 
     def _on_line_style_changed(self, style: str) -> None:
-        """线型变化：作用到所有图形工具，保存到设置。"""
+        """线型变化：作用到画笔与所有形状工具，保存到设置。"""
         self.settings.set_line_style(style)
         self.settings.sync()
+        # 画笔也算描边工具：选了虚线/点线之后手绘笔迹也该是虚线
+        self.tools["pen"].line_style = style
         for kind in SHAPE_TOOL_KEYS:
             self.tools[kind].line_style = style
         current = self.settings.current_tool()
-        if current in SHAPE_SPECS:
-            forced = SHAPE_SPECS[current][2]
-            message = f"线型：{LINE_STYLE_LABELS.get(style, style)}"
-            if forced:
-                message += f"（当前图形「{shape_label(current)}」固定为虚线）"
-            self.statusBar().showMessage(message, 2000)
+        label = LINE_STYLE_LABELS.get(style, style)
+        if current in SHAPE_SPECS and SHAPE_SPECS[current][2]:
+            self.statusBar().showMessage(
+                f"线型：{label}（当前图形「{shape_label(current)}」固定为虚线）", 2000)
+        else:
+            self.statusBar().showMessage(f"线型：{label}（画笔与形状都用它）", 2000)
 
     def _on_text_format_changed(self, fmt: TextFormat) -> None:
         """文字对话框里改了颜色时，同步工具栏颜色按钮与设置。"""

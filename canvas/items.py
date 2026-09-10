@@ -146,18 +146,21 @@ class StrokeItem(QGraphicsPathItem):
     用中点二次贝塞尔拟合生成：
     - 曲线平滑，不会出现折线感；
     - 序列化时直接写出原始点，不会因为路径含曲线段而丢点。
+
+    线型跟随工具栏的「线型」选择，所以画笔也能画虚线/点线
+    （线型存在画笔对象上，序列化写 ``line_style``）。
     """
 
     TYPE = "stroke"
 
     def __init__(self, points=None, color: QColor = None, thickness: float = 2.0,
-                 pos: QPointF = None):
+                 pos: QPointF = None, line_style=DEFAULT_LINE_STYLE):
         pts = [QPointF(p) for p in (points or [])]
         super().__init__(build_path(pts))
         self._points = pts
         if color is None:
             color = QColor(Qt.GlobalColor.black)
-        self.setPen(make_pen(color, thickness))
+        self.setPen(make_pen(color, thickness, line_style))
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
         if pos is not None:
             self.setPos(pos)
@@ -190,6 +193,7 @@ class StrokeItem(QGraphicsPathItem):
             "type": self.TYPE,
             "color": rgba_list(self.pen().color()),
             "thickness": round(self.pen().widthF(), 3),
+            "line_style": line_style_name(self.pen().style()),
             "points": [[round(p.x(), 3), round(p.y(), 3)] for p in self._points],
             "pos": [self.pos().x(), self.pos().y()],
         }
@@ -201,6 +205,7 @@ class StrokeItem(QGraphicsPathItem):
             pts,
             qcolor_from_rgba(data.get("color", [0, 0, 0, 255])),
             float(data.get("thickness", 2.0)),
+            line_style=data.get("line_style", DEFAULT_LINE_STYLE),
         )
         pos = data.get("pos")
         if pos:

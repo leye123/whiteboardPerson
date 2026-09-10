@@ -1,8 +1,11 @@
 """线型选择器（widgets/line_style_picker.py）。
 
 工具栏上的一个小下拉框：实线 / 虚线 / 点线 / 点划线。
-选中的线型会立即作用到形状工具，于是**任何形状都能画成虚线**
-（矩形、椭圆、三角形、箭头都行），而不是只有「虚线」那两种固定图形。
+选中的线型会立即作用到**画笔**与形状工具，因此：
+
+* 手绘笔迹也能是虚线/点线（预览与最终笔迹一致）；
+* 任何形状都能画成虚线（矩形、椭圆、三角形、箭头都行），
+  而不只是「虚线」「虚线箭头」那两种固定图形。
 
 下拉项自带一段该线型的预览线，选之前就能看出效果。
 """
@@ -27,7 +30,7 @@ class LineStylePicker(QComboBox):
         super().__init__(parent)
         # 工具栏会拉伸最后一个控件，这里锁死宽度（同 ThicknessSlider 的坑）
         self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-        self.setToolTip("线型：作用于直线/箭头/矩形/椭圆等所有描边图形")
+        self.setToolTip("线型：画笔手绘与直线/箭头/矩形/椭圆等所有描边图形都用它")
         self.setMinimumWidth(96)
         for name in STYLE_ORDER:
             if name not in LINE_STYLES:

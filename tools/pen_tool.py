@@ -5,13 +5,16 @@
    因此笔迹是实时可见的；
 2. 抬笔时把预览项从场景移除，改为压入一条 :class:`AddItemCommand`，
    由撤销栈统一管理（预览项不进入历史，也不会被自动保存）。
+
+线型（实线/虚线/点线/点划线）由工具栏的「线型」下拉框决定，
+预览与最终笔迹用的是同一种，所以画的时候看到什么就是什么。
 """
 from __future__ import annotations
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor
 
-from canvas.items import StrokeItem, mark_preview
+from canvas.items import DEFAULT_LINE_STYLE, StrokeItem, mark_preview
 from core.history import AddItemCommand
 from tools.base_tool import BaseTool
 
@@ -25,10 +28,12 @@ class PenTool(BaseTool):
     name = "画笔"
     cursor = Qt.CursorShape.CrossCursor
 
-    def __init__(self, color: QColor = None, thickness: float = 2.0) -> None:
+    def __init__(self, color: QColor = None, thickness: float = 2.0,
+                 line_style: str = DEFAULT_LINE_STYLE) -> None:
         super().__init__()
         self.color = QColor(color) if color is not None else QColor(Qt.GlobalColor.black)
         self.thickness = float(thickness)
+        self.line_style = line_style
         # 绘制中间态
         self._points = []
         self._preview_item = None
@@ -41,7 +46,8 @@ class PenTool(BaseTool):
         self._points = [pos]
         self._drawing = True
 
-        item = StrokeItem([], self.color, self.thickness)
+        item = StrokeItem([], self.color, self.thickness,
+                          line_style=self.line_style)
         mark_preview(item)
         scene.addItem(item)
         self._preview_item = item
@@ -88,7 +94,8 @@ class PenTool(BaseTool):
             event.accept()
             return
 
-        item = StrokeItem(points, self.color, self.thickness)
+        item = StrokeItem(points, self.color, self.thickness,
+                          line_style=self.line_style)
         stack = self.undo_stack(view)
         if stack is not None:
             stack.push(AddItemCommand(scene, item, "画笔"))
