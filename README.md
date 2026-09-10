@@ -27,54 +27,6 @@ python -m venv .venv
 python -m pip install -r requirements.txt
 ```
 
-### 激活虚拟环境
-
-仓库里已经带了一个可用的 `.venv`（Python 3.10.19 + PySide6 6.11.2），三种方式任选：
-
-```powershell
-# PowerShell
-.\.venv\Scripts\Activate.ps1
-```
-
-```bat
-:: CMD / 批处理
-.venv\Scripts\activate.bat
-```
-
-```bash
-# Git Bash / MSYS
-source .venv/Scripts/activate
-```
-
-激活后提示符前会出现 `(.venv)`，`python` 会指向 `.venv\Scripts\python.exe`：
-
-```powershell
-python -c "import sys, PySide6; print(sys.prefix, PySide6.__version__)"
-# G:\code\python\whiteboard\.venv 6.11.2
-python main.py          # 启动白板
-deactivate              # 退出虚拟环境
-```
-
-**不想激活也可以**（脚本、定时任务里更省事，也是本项目所有测试/工具的做法）：
-
-```powershell
-.\.venv\Scripts\python.exe main.py
-.\.venv\Scripts\python.exe tests\smoke_test.py
-```
-
-> 若 PowerShell 提示「禁止运行脚本」（`UnauthorizedAccess`），只对当前窗口放开即可：
-> `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force`，
-> 或改用上面的 `activate.bat`。
-
-如果所在网络无法用 pip 正常下载（例如临时目录被安全策略限制、下载中断），
-可以用随附的离线安装脚本：它会用 `urllib` 下载 wheel 并直接解压到
-site-packages，支持断点续传与国内镜像。
-
-```bash
-python scripts/install_wheels.py            # 自动选版本（镜像优先，官方兜底）
-python scripts/install_wheels.py --version 6.11.2
-```
-
 ## 2. 运行
 
 ```bash
@@ -134,19 +86,20 @@ whiteboard/
 
 ## 4. 操作指南
 
-| 操作 | 方式 |
-|------|------|
-| 工具切换 | 工具栏按钮或「编辑」菜单 |
-| 拖动画布 | ① 工具栏「拖动」工具（四向箭头图标）：选中后左键拖拽即可；② 按住空格 + 左键拖拽；③ 中键拖拽 |
-| 橡皮擦 | 拖动擦掉经过的**笔迹片段**（擦断，不是整条删除）；矩形/椭圆/直线/文字/图片被碰到时整体删除；光标处会显示作用范围圆圈，大小随「粗细」滑块调整 |
-| 选择/移动 | 选择工具：点击选中、Ctrl 多选、空白处拖拽框选；拖动整体移动 |
-| 编辑文字 | 选择工具双击文字对象 |
-| 缩放 | 鼠标滚轮（以光标为中心）；`+`/`-`、`Ctrl+0` 适应窗口、`Ctrl+1` 实际大小 |
-| 撤销/重做 | `Ctrl+Z` / `Ctrl+Y`（或 `Ctrl+Shift+Z`）；一次擦除拖拽 = 一个撤销步骤 |
-| 删除 | 选择工具选中后按 `Delete` |
-| 页面 | `Ctrl+T` 新建；`PgUp`/`PgDn` 切换；`Ctrl+Shift+D` 删除当前页 |
-| 文件 | `Ctrl+S` 保存、`Ctrl+Shift+S` 另存为、`Ctrl+O` 打开、`Ctrl+E` 导出 PNG、`Ctrl+I` 导入图片 |
-| 恢复默认设置 | 「视图 → 恢复默认设置…」（清掉颜色/粗细/工具/主题等偏好，画布内容不动） |
+
+| 操作         | 方式                                                                                                                                         |
+| ------------ | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| 工具切换     | 工具栏按钮或「编辑」菜单                                                                                                                     |
+| 拖动画布     | ① 工具栏「拖动」工具（四向箭头图标）：选中后左键拖拽即可；② 按住空格 + 左键拖拽；③ 中键拖拽                                               |
+| 橡皮擦       | 拖动擦掉经过的**笔迹片段**（擦断，不是整条删除）；矩形/椭圆/直线/文字/图片被碰到时整体删除；光标处会显示作用范围圆圈，大小随「粗细」滑块调整 |
+| 选择/移动    | 选择工具：点击选中、Ctrl 多选、空白处拖拽框选；拖动整体移动                                                                                  |
+| 编辑文字     | 选择工具双击文字对象                                                                                                                         |
+| 缩放         | 鼠标滚轮（以光标为中心）；`+`/`-`、`Ctrl+0` 适应窗口、`Ctrl+1` 实际大小                                                                      |
+| 撤销/重做    | `Ctrl+Z` / `Ctrl+Y`（或 `Ctrl+Shift+Z`）；一次擦除拖拽 = 一个撤销步骤                                                                        |
+| 删除         | 选择工具选中后按`Delete`                                                                                                                     |
+| 页面         | `Ctrl+T` 新建；`PgUp`/`PgDn` 切换；`Ctrl+Shift+D` 删除当前页                                                                                 |
+| 文件         | `Ctrl+S` 保存、`Ctrl+Shift+S` 另存为、`Ctrl+O` 打开、`Ctrl+E` 导出 PNG、`Ctrl+I` 导入图片                                                    |
+| 恢复默认设置 | 「视图 → 恢复默认设置…」（清掉颜色/粗细/工具/主题等偏好，画布内容不动）                                                                    |
 
 ## 5. 实现要点
 
@@ -182,68 +135,6 @@ whiteboard/
   * 导出前要**临时取消选中**：`QGraphicsTextItem` 等对象在选中态会用高亮色绘制，
     不清掉的话导出图里会带上选中高亮；点阵网格也要临时隐藏。
     测试用「选中状态导出的图 == 无选中状态导出的图」逐像素比对来卡这一点。
-
-### 5.1 图标（`widgets/icons.py`）
-
-图标全部由 QPainter 在运行时绘制，因此会随主题重新着色、打包时不需要资源文件。
-两个必须注意的坑：
-
-1. **同一个 QIcon 里不要混入设置了 `devicePixelRatio` 的位图。**
-   QIcon 只按“位图的设备尺寸”挑最接近的一张，而且永远不会向上放大。
-   如果放入 20×20(DPR=1) 和 40×40(DPR=2) 两张，在 125% 缩放的屏幕上
-   （按钮需要 30 设备像素）Qt 可能挑中 40×40 那张，其逻辑尺寸变成 32，
-   于是图标在 24 像素的按钮里被画得又小又偏 —— 表现为「图标显示不全」。
-   正确做法是准备**多个离散尺寸**（16/20/24/30/32/40/48/64），DPR 一律为 1。
-2. **轮廓要闭合、坐标要留在安全区内。**
-   `QPainter.drawPolygon` 不会自动闭合，笔、橡皮这类轮廓不闭合就会出现
-   “线条少一段”；所有坐标限制在 2.2~17.8（20×20 坐标系内），
-   给线宽和圆帽留余量，避免贴边被裁。
-
-工具栏还有一个隐蔽问题：`QToolBar` 会拉伸最后加入的、允许变宽的控件，
-导致「粗细」两个字留在左边、滑块被推到窗口最右边。`ThicknessSlider`
-因此显式设置 `QSizePolicy.Fixed`。
-
-![图标总览](docs/icons.png)
-
-### 5.2 四个 PySide6 / Graphics View 的坑（都会表现为「功能静默失效」）
-
-1. **`QGraphicsScene.setSelectionArea(path, mode)` 必须用关键字传 `mode`。**
-   PySide6 暴露了 `(path, deviceTransform)` 重载，位置参数传枚举会被解析成
-   `QTransform` —— 轻则 `TypeError`，重则**段错误**。更麻烦的是这个异常发生在
-   C++ 调用进来的事件处理函数里，会被直接吞掉，用户看到的就是「框选毫无反应」。
-2. **`QGraphicsView(scene)` 构造不会调用 Python 覆盖的 `setScene()`。**
-   初始场景必须自己连信号，否则首页收不到 `selectionChanged`；
-   切页时则要断开旧场景再连新场景，不然会连到已经丢弃的页面上。
-3. **画在 `drawForeground` / 视口叠加层上的东西，必须自己失效对应区域，而且缓存位置要能跟上。**
-   选中虚线框不在任何图形项的包围盒里，Qt 的增量重绘（本视图用
-   `BoundingRectViewportUpdate`）不会刷新它 —— 框选、取消选中、移动之后，
-   上一次的虚线框会留在屏幕上，看起来「白板上多了一堆框」。
-
-   这里踩过两个层次的坑：
-
-   * 只监听 `selectionChanged` 还不够：缓存里存的是**移动前**的框位置，
-     而框本身已经跟着图形项跑到新位置了，于是下一次失效重绘只刷新老位置，
-     **新位置上的框永远擦不掉**（用户反馈的正是「移动之后第一个框选的符号还留着框」）。
-     所以还要监听 `scene.changed`（`WhiteboardView._on_scene_changed`），
-     在图形项移动/改形时刷新缓存并把「旧位置 ∪ 新位置」都标脏。
-   * 顺便把选中框从 `scene.drawForeground` 挪到了**视口叠加层**
-     （`WhiteboardView._draw_selection_boxes`）：这样绘制与失效用同一套视口坐标，
-     而且选中框不会被 `scene.render()` 画进导出的 PNG
-     （测试里用「选中状态导出的图 == 无选中状态导出的图」来卡这一点）。
-
-   同类问题还有工具里临时加进场景的辅助图形项（框选矩形），
-   必须保证在任何中断路径（切工具、手势被打断）上都被移除，
-   否则会一直叠在白板上。
-4. **测试不能靠 `QSettings.setDefaultFormat(IniFormat)` + `setPath()` 来隔离配置。**
-   Qt 6 在 Windows 上对 `QSettings(org, app)` 仍然读写注册表（实测 `fileName()`
-   依旧是 `HKEY_CURRENT_USER\...`），于是测试会把「粗细=40、当前工具=橡皮」
-   写进用户的真实配置，再反过来污染后续测试。
-   正解：`core.settings.AppSettings` 支持 `WHITEBOARD_CONFIG` 环境变量指向一个
-   `.ini`，测试用它做隔离：
-
-   ```python
-   os.environ["WHITEBOARD_CONFIG"] = os.path.join(tmp_dir, "whiteboard.ini")
-   ```
 
 ## 6. `.wbd` 文件格式
 
@@ -307,12 +198,13 @@ python scripts/cleanup.py --settings-only  # 只删配置，保留自动备份
 python scripts/cleanup.py --legacy-only    # 只清旧版遗留（注册表 + 旧数据目录）
 ```
 
-| 内容 | 位置 |
-|------|------|
-| 配置（当前版本）| 软件目录 `whiteboard.ini` |
-| 自动备份 | 软件目录 `autosave.wbd` |
-| 旧版注册表偏好（若存在）| `HKCU\Software\WhiteboardPyside\Whiteboard` |
-| 旧版数据目录（若存在）| `%APPDATA%\WhiteboardPyside\{Whiteboard, 我的白板}` |
+
+| 内容                     | 位置                                                |
+| ------------------------ | --------------------------------------------------- |
+| 配置（当前版本）         | 软件目录`whiteboard.ini`                            |
+| 自动备份                 | 软件目录`autosave.wbd`                              |
+| 旧版注册表偏好（若存在） | `HKCU\Software\WhiteboardPyside\Whiteboard`         |
+| 旧版数据目录（若存在）   | `%APPDATA%\WhiteboardPyside\{Whiteboard, 我的白板}` |
 
 手动清理：`reg delete "HKCU\Software\WhiteboardPyside" /f`，
 以及删掉 `%APPDATA%\WhiteboardPyside`。
