@@ -867,6 +867,82 @@ def test_icon_file_has_all_sizes():
         assert not missing, f"resources 里的 .ico 缺少尺寸 {missing}"
 
 
+def test_text_dialog_widgets_drive_the_format():
+    """文字对话框真控件走一遍：参数改动能落到 TextFormat 上，导入字体进列表。"""
+    from PySide6.QtWidgets import QFileDialog, QMessageBox
+
+    from core.settings import AppSettings
+    from core.text_format import TextFormat
+    from widgets.text_dialog import TextDialog
+
+    settings = AppSettings()
+    dialog = TextDialog(None, "输入文字", "初始文本",
+                        TextFormat(pixel_size=20, color=QColor("#112233")), settings)
+    dialog.editor.setPlainText("要保存的文字")
+
+    # 字体列表必须非空，且当前项就是传入的排版
+    assert dialog.font_combo.count() > 0
+    assert dialog.result_text() == "要保存的文字"
+    assert dialog.current_format().pixel_size == 20
+    assert dialog.current_format().color.name() == "#112233"
+
+    # 改控件 -> 排版跟着变（字号/粗体/颜色/换行/宽度/对齐）
+    dialog.size_spin.setValue(33)
+    dialog.bold_button.setChecked(True)
+    dialog.italic_button.setChecked(True)
+    dialog.color_picker.set_color(QColor("#aa3344"))
+    dialog.wrap_check.setChecked(True)
+    dialog.width_spin.setValue(260)
+    dialog.align_combo.setCurrentIndex(dialog.align_combo.findData("center"))
+    fmt = dialog.current_format()
+    assert fmt.pixel_size == 33 and fmt.bold and fmt.italic
+    assert fmt.color.name() == "#aa3344"
+    assert fmt.wrap and fmt.text_width == 260 and fmt.align == "center"
+    # 编辑区实时预览：字体/颜色/折行都套上了
+    assert dialog.editor.font().pixelSize() == 33
+    assert dialog.editor.lineWrapMode() == dialog.editor.LineWrapMode.FixedPixelWidth
+    assert dialog.editor.lineWrapColumnOrWidth() == 260
+
+    # 关闭自动换行后折行宽度不可编辑
+    dialog.wrap_check.setChecked(False)
+    assert not dialog.width_spin.isEnabled()
+    assert dialog.editor.lineWrapMode() == dialog.editor.LineWrapMode.NoWrap
+
+    # 空文本不该被当成有效输入
+    dialog.editor.setPlainText("   ")
+    assert dialog.result_text() == ""
+
+    # 导入字体：走真实的对话框逻辑（只把文件选择与提示框替换掉）
+    source = None
+    for candidate in ("C:/Windows/Fonts/consola.ttf", "C:/Windows/Fonts/arial.ttf",
+                      "C:/Windows/Fonts/segoeui.ttf"):
+        if os.path.exists(candidate):
+            source = candidate
+            break
+    if source:
+        original_open = QFileDialog.getOpenFileName
+        original_info = QMessageBox.information
+        original_warning = QMessageBox.warning
+        QFileDialog.getOpenFileName = staticmethod(lambda *a, **k: (source, ""))
+        QMessageBox.information = staticmethod(lambda *a, **k: None)
+        QMessageBox.warning = staticmethod(lambda *a, **k: None)
+        try:
+            dialog.import_font()
+            family = dialog.font_combo.currentData()
+            assert family, "导入字体后应当自动选中该字体"
+            assert dialog.font_combo.findData(family) >= 0
+            from core import fonts as fonts_module
+            assert fonts_module.stored_paths(settings), "导入的字体要记进设置"
+        finally:
+            QFileDialog.getOpenFileName = original_open
+            QMessageBox.information = original_info
+            QMessageBox.warning = original_warning
+        settings.reset()
+    else:
+        print("      （跳过导入字体部分：本机找不到可用的 .ttf）")
+    dialog.close()
+
+
 # ------------------------------------------------------------------ 运行器
 
 

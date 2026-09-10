@@ -53,10 +53,15 @@ class TextDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle(title)
         self.settings = settings
-        self._format = (fmt or TextFormat()).copy()
+        # 注意：这里要**先**把调用方给的排版存一份。
+        # _build_ui() 里重建字体列表会触发一次预览，而预览会把 self._format
+        # 更新成「控件当前值」—— 如果直接用它去 _load_format，
+        # 传进来的字号/换行宽度就被控件默认值（6px / 40px）覆盖掉了。
+        self._initial_format = (fmt or TextFormat()).copy()
+        self._format = self._initial_format.copy()
         self._build_ui()
         self.editor.setPlainText(text or "")
-        self._load_format(self._format)
+        self._load_format(self._initial_format)
         self.editor.setFocus()
         # 光标放到末尾，编辑已有文字时接着写
         cursor = self.editor.textCursor()
@@ -182,12 +187,17 @@ class TextDialog(QDialog):
                 families.append(name)
         if select and select not in families:
             families.insert(0, select)          # 缺失的字体也保留一个占位项
+        if not families:
+            # 极端情况下（例如没有字体目录的精简/CI 环境）别给用户一个空列表：
+            # 放一项「系统默认字体」，family 为空 = 跟随 Qt 的默认字体。
+            families = [""]
         self.font_combo.blockSignals(True)
         self.font_combo.clear()
         for name in families:
-            self.font_combo.addItem(name, name)
+            self.font_combo.addItem(name or "（系统默认字体）", name)
             self.font_combo.setItemData(
-                self.font_combo.count() - 1, QFont(name), Qt.ItemDataRole.FontRole)
+                self.font_combo.count() - 1, QFont(name) if name else QFont(),
+                Qt.ItemDataRole.FontRole)
         index = self.font_combo.findData(select) if select else -1
         self.font_combo.setCurrentIndex(index if index >= 0 else 0)
         self.font_combo.blockSignals(False)

@@ -87,7 +87,7 @@ whiteboard/
 │   ├── check_icons.py       # 图标自检：贴边裁切/空白/被拉伸 + 生成总览图
 │   └── icon_ascii.py        # 在终端用 ASCII 点阵“看”图标（排查线条断裂）
 ├── tests/
-│   ├── test_core.py         # 29 项核心逻辑单元测试（无需 pytest）
+│   ├── test_core.py         # 30 项核心逻辑单元测试（无需 pytest）
 │   └── smoke_test.py        # 88 项端到端冒烟测试（offscreen，无需显示器）
 └── docs/                    # 截图与图标总览图
 ```
@@ -262,7 +262,7 @@ python scripts/cleanup.py --legacy-only    # 只清旧版遗留（注册表 + �
 
 ```bash
 # 核心逻辑单元测试（笔画/擦除切分/形状与线型/文字排版/字体导入/序列化/撤销命令）
-python tests/test_core.py            # 29/29
+python tests/test_core.py            # 30/30
 
 # 端到端冒烟测试：画笔→撤销→形状（11 种）→虚线→橡皮擦断→框选→拖动→文字排版
 #                 →导入图片→多页面→存取→导出 PNG→主题
