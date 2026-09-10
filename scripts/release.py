@@ -128,6 +128,8 @@ def main() -> int:
     parser.add_argument("--no-build", action="store_true", help="跳过打包，复用已有产物")
     parser.add_argument("--dry-run", action="store_true", help="只打印步骤")
     parser.add_argument("--draft", action="store_true", help="创建草稿 Release")
+    parser.add_argument("--zip-only", action="store_true",
+                        help="只打包成 zip 并打标签，不碰 GitHub")
     parser.add_argument("--source", default=None, help="待打包的产物目录")
     parser.add_argument("--notes-file", default=None, help="Release 说明文件（markdown）")
     args = parser.parse_args()
@@ -159,6 +161,12 @@ def main() -> int:
     else:
         git("tag", "-a", tag, "-m", f"{APP_TITLE} {tag}", dry_run=args.dry_run)
         print(f"  已创建标签 {tag}（推送：git push origin {tag}）")
+
+    if args.zip_only:
+        print("\n--zip-only：已生成发布包，未创建 GitHub Release。")
+        print(f"  发布包：{archive}")
+        print(f"  之后可执行：gh release create {tag} \"{archive}\" --title \"{tag}\"")
+        return 0
 
     print("[4/4] 创建 GitHub Release 并上传")
     if not has_gh():
