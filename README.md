@@ -59,7 +59,7 @@
 ### 方式二：从源码运行（开发者）
 
 ```powershell
-git clone https://github.com/<你的用户名>/whiteboardPerson.git
+git clone https://github.com/leye123/whiteboardPerson.git
 cd whiteboardPerson
 
 python -m venv .venv
@@ -143,86 +143,19 @@ autosave.wbd        ← 自动备份
 
 ---
 
-## 打包发布
-
-### 版本号
-
-版本号**只有一个来源**：`core/version.py` 里的 `__version__`。它同时决定
-
-* 可执行文件的 Windows 版本资源（右键属性 → 详细信息）；
-* 产物文件名（`Whiteboard-1.0.0.exe` / `Whiteboard-1.0.0-win64.zip`）；
-* git 标签与 GitHub Release 的标签。
-
-### 打包
-
-推荐 **PyInstaller**（不需要 C 编译器，几分钟出包）：
-
-```powershell
-python -m pip install pyinstaller
-python build_exe.py --onedir             # -> dist/Whiteboard-1.0.0/（启动快，推荐发布用）
-python build_exe.py                      # -> dist/Whiteboard-1.0.0.exe（单文件，便于分发）
-```
-
-也可以用 **Nuitka**（编译成 C，产物更小、启动更快，但要装编译器且**首次编译很慢**）：
-
-```powershell
-python -m pip install nuitka
-python build_exe.py --nuitka --onedir --no-lto   # --no-lto 可显著缩短打包时间
-python build_exe.py --nuitka                     # 单文件
-```
-
-打包完成后建议先自检，确认配置会写在 exe 旁边而不是临时解包目录：
-
-```powershell
-Whiteboard.exe --paths
-```
-
-### 一键发布到 GitHub Release
-
-```powershell
-python scripts/release.py                 # 打包 + 生成发布资产 + 建标签 + 上传 Release
-python scripts/release.py --no-build      # 复用已有产物，只做资产与上传
-python scripts/release.py --zip-only      # 只生成发布资产，不碰 GitHub
-python scripts/release.py --source dist\Whiteboard-1.0.0   # 指定要打包的产物
-python scripts/release.py --draft         # 建草稿 Release
-python scripts/release.py --dry-run       # 只显示将要执行的步骤
-```
-
-脚本会
-
-1. 调用 `build_exe.py --onedir` 构建（除非 `--no-build`）；
-2. 生成发布资产（输出到 `dist/`）：
-   * 目录版 → `Whiteboard-1.0.0-win64.zip`（解压即用）；
-   * 单文件版 → `Whiteboard-1.0.0-win64.exe`；
-3. 打上 `v1.0.0` 标签；
-4. 用 `gh release create` 创建 Release 并上传资产。
-
-前提：安装了 [GitHub CLI](https://cli.github.com/) 并已登录（`gh auth login`）。
-没有 gh 也可以手工做：
-
-```powershell
-git tag v1.0.0
-git push origin main --tags
-gh release create v1.0.0 "dist\Whiteboard-1.0.0-win64.zip" "dist\Whiteboard-1.0.0-win64.exe" `
-  --title "v1.0.0" --notes-file docs\RELEASE_NOTES_v1.0.0.md
-```
-
----
-
 ## 项目结构
 
 ```
 whiteboard/
 ├── main.py              # 入口（--paths 打印配置位置）
 ├── main_window.py       # 主窗口：菜单/工具栏/状态栏/多页面/自动保存/主题
-├── build_exe.py         # 打包脚本（PyInstaller / Nuitka，写入版本资源）
 ├── canvas/              # scene（点阵背景、命中查询）/ view（事件路由、缩放平移、叠加层）/ items
 ├── tools/               # 工具（策略模式）：选择、拖动、画笔、橡皮、形状、文字
 ├── core/                # stroke / page / history / settings / paths / version
 ├── persistence/         # .wbd 序列化与原子读写
 ├── widgets/             # 图标（运行时绘制）、取色按钮、粗细滑块、页面切换器
 ├── resources/styles/    # 浅色 / 深色 QSS
-├── scripts/             # release / cleanup / check_icons / icon_ascii / screenshot / install_wheels
+├── scripts/             # 图标自检、截图、离线安装依赖等开发辅助脚本
 ├── tests/               # 单元测试 + 端到端冒烟测试
 └── docs/                # 截图与图标总览
 ```
@@ -240,18 +173,13 @@ python scripts\check_icons.py # 图标自检：贴边裁切、空白、工具栏
 两个测试脚本都自动使用 `QT_QPA_PLATFORM=offscreen`，退出码 0 表示全部通过；
 测试通过 `WHITEBOARD_CONFIG` / `WHITEBOARD_DATA_DIR` 完全隔离，不会碰你的真实配置。
 
-> 详细设计说明与踩坑记录（Graphics View 增量重绘、PySide6 重载坑、打包后路径判定等）
-> 写在本地的 `DEVELOPMENT.md` 里 —— 那是个人开发笔记，已加入 `.gitignore`，不随仓库发布。
-
 ---
 
 ## 已知限制
 
 * 选择工具支持移动，暂未提供缩放 / 旋转控制点；
 * 矩形 / 椭圆 / 直线 / 文字 / 图片无法「擦断」，被橡皮碰到时整体删除；
-* 画布范围为 20000 × 20000 的近似无限画布，超出该范围的内容不参与渲染；
-* 单文件（`--onefile`）打包在启动时会解包到临时目录，首次启动较慢；
-  追求启动速度请用 `--onedir` 版本。
+* 画布范围为 20000 × 20000 的近似无限画布，超出该范围的内容不参与渲染。
 
 ## 许可证
 
