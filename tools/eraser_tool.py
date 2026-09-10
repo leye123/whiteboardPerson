@@ -31,7 +31,7 @@ from canvas.items import (
     line_style_name,
 )
 from core.history import ReplaceItemsCommand
-from core.stroke import split_by_eraser
+from core.stroke import cumulative_lengths, split_by_eraser
 from tools.base_tool import BaseTool
 
 # 无法擦断、只能整体删除的图形（形状/文字/图片都属此类）
@@ -127,12 +127,24 @@ class EraserTool(BaseTool):
         segments = [run for run in runs if len(run) >= MIN_SEGMENT_POINTS]
 
         pen = item.pen()
+        style = line_style_name(pen.style())
         origin = QPointF(item.pos())
+        # 虚线相位：碎片要知道自己「从原笔迹多长的地方开始」，
+        # 否则虚线图案会在断口处重新起头，断口之后的虚线整段移位。
+        lengths = cumulative_lengths(points)
+        base_offset = item.dash_offset()
         self._remove(item, scene)
+        cursor = 0
         for run in segments:
+            try:
+                start_index = points.index(run[0], cursor)
+            except ValueError:                       # 理论上不会发生
+                start_index = cursor
+            cursor = start_index
             # 碎片要继承原笔迹的颜色/线宽/线型，否则擦一下虚线会变成实线
             segment = StrokeItem(run, pen.color(), pen.widthF(), pos=origin,
-                                 line_style=line_style_name(pen.style()))
+                                 line_style=style,
+                                 dash_offset=base_offset + lengths[start_index])
             scene.addItem(segment)
             self._added.append(segment)
 

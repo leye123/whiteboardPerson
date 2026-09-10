@@ -31,6 +31,7 @@ from PySide6.QtGui import (
     QPen,
     QPixmap,
     QPolygonF,
+    QTransform,
 )
 from PySide6.QtWidgets import (
     QGraphicsEllipseItem,
@@ -149,18 +150,28 @@ class StrokeItem(QGraphicsPathItem):
 
     线型跟随工具栏的「线型」选择，所以画笔也能画虚线/点线
     （线型存在画笔对象上，序列化写 ``line_style``）。
+
+    ``dash_offset`` 记录「这条笔迹从原笔迹的哪个位置开始」：
+    橡皮擦擦断虚线后，碎片带上这个偏移，虚线图案才不会在断口处重新起头
+    （否则看起来像整段虚线往后退了一截）。
     """
 
     TYPE = "stroke"
 
     def __init__(self, points=None, color: QColor = None, thickness: float = 2.0,
-                 pos: QPointF = None, line_style=DEFAULT_LINE_STYLE):
+                 pos: QPointF = None, line_style=DEFAULT_LINE_STYLE,
+                 dash_offset: float = 0.0):
         pts = [QPointF(p) for p in (points or [])]
         super().__init__(build_path(pts))
         self._points = pts
+        # 线型单独记一份：setDashOffset() 会把画笔样式改写成 CustomDashLine，
+        # 之后就不能再靠 pen().style() 反推用户选的是点线还是虚线了。
+        self._line_style = line_style_name(line_style)
+        self._dash_offset = float(dash_offset or 0.0)
         if color is None:
             color = QColor(Qt.GlobalColor.black)
         self.setPen(make_pen(color, thickness, line_style))
+        self._apply_dash_offset()
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
         if pos is not None:
             self.setPos(pos)
@@ -184,6 +195,49 @@ class StrokeItem(QGraphicsPathItem):
     def _rebuild(self) -> None:
         self.setPath(build_path(self._points))
 
+    # ---------------------------------------------------------- 虚线相位
+    def line_style(self) -> str:
+        """用户选的线型名字（solid/dash/dot/dash_dot）。
+
+        不能看 ``pen().style()``：设过 dashOffset 之后它统一变成 CustomDashLine。
+        """
+        return self._line_style
+
+    def dash_offset(self) -> float:
+        """虚线相位（场景单位 = 从原笔迹起点算起的弧长）。"""
+        return self._dash_offset
+
+    def set_dash_offset(self, offset: float) -> None:
+        """设置虚线相位偏移（场景单位，等于「到原笔迹起点的弧长」）。"""
+        self._dash_offset = float(offset or 0.0)
+        self._apply_dash_offset()
+        self.update()
+
+    def _apply_dash_offset(self) -> None:
+        """把相位写进画笔。
+
+        两个坑：
+
+        * ``QPen.setDashOffset()`` 的单位是**线宽**（和 ``setDashPattern`` 一致），
+          不是像素 —— 直接传弧长会得到完全错误的相位（实测差几像素到整段虚线）。
+          所以这里除以线宽换算成 Qt 的单位。
+        * 设过 offset 之后画笔样式会变成 ``CustomDashLine``
+          （内置虚线的图案被展开成 ``dashPattern()``），可以利用这一点
+          拿到虚线周期，把偏移归一到 ``[0, 一个周期)``，免得长笔迹把值堆到几万。
+        """
+        pen = self.pen()
+        width = pen.widthF() or 1.0
+        if self._dash_offset:
+            pen.setDashOffset(self._dash_offset / width)
+            pattern = pen.dashPattern()
+            period = sum(pattern) * width if pattern else 0.0
+            if period > 0:
+                normalized = self._dash_offset % period
+                if abs(normalized - self._dash_offset) > 1e-9:
+                    self._dash_offset = normalized
+                    pen.setDashOffset(normalized / width)
+        super().setPen(pen)
+
     # ---------------------------------------------------------- 绘制接口
     def shape(self) -> QPainterPath:  # 加粗命中区
         return stroked_shape(self.path(), self.pen().widthF())
@@ -193,7 +247,8 @@ class StrokeItem(QGraphicsPathItem):
             "type": self.TYPE,
             "color": rgba_list(self.pen().color()),
             "thickness": round(self.pen().widthF(), 3),
-            "line_style": line_style_name(self.pen().style()),
+            "line_style": self._line_style,
+            "dash_offset": round(self._dash_offset, 3),
             "points": [[round(p.x(), 3), round(p.y(), 3)] for p in self._points],
             "pos": [self.pos().x(), self.pos().y()],
         }
@@ -206,6 +261,7 @@ class StrokeItem(QGraphicsPathItem):
             qcolor_from_rgba(data.get("color", [0, 0, 0, 255])),
             float(data.get("thickness", 2.0)),
             line_style=data.get("line_style", DEFAULT_LINE_STYLE),
+            dash_offset=float(data.get("dash_offset", 0.0)),
         )
         pos = data.get("pos")
         if pos:
@@ -680,6 +736,79 @@ class TextItem(QGraphicsTextItem):
     def font_file(self) -> str:
         return self._font_file
 
+    # ---------------------------------------------------------- 自由伸缩
+    def is_resizable(self) -> bool:
+        return True
+
+    def resize_rect(self) -> QRectF:
+        """文字块的显示区域（场景坐标）。
+
+        用 ``boundingRect`` 而不是 ``document().size()``：前者已经把字体、
+        换行宽度与对齐都算进去了。
+        """
+        return self.mapRectToScene(self.boundingRect())
+
+    def resize_state(self) -> dict:
+        font = self.font()
+        return {
+            "pixel_size": int(font.pixelSize()),
+            "text_width": round(self._text_width, 3),
+            "pos": [self.pos().x(), self.pos().y()],
+        }
+
+    def restore_resize_state(self, state: dict) -> None:
+        font = self.font()
+        font.setPixelSize(int(max(6, state.get("pixel_size", font.pixelSize()))))
+        self.setFont(font)
+        if state.get("text_width") is not None:
+            self._text_width = max(20.0, float(state["text_width"]))
+            self._apply_wrap()
+        pos = state.get("pos")
+        if pos:
+            self.setPos(QPointF(pos[0], pos[1]))
+        self.update()
+
+    def resize_with(self, index: int, point: QPointF, keep_aspect: bool = False) -> None:
+        """拖手柄缩放文字：改字号（等比），勾了自动换行时折行宽度一起缩放。
+
+        文字不能像图片那样横向拉扁（字形会变形），所以这里始终等比：
+        按手柄所在方向算出倍数，取字号能落到的整数值，再反算出实际倍数，
+        把锚点（对角 / 对边）固定在原位。
+        """
+        from canvas.resize import BOTTOM_HANDLES, LEFT_HANDLES, RIGHT_HANDLES, TOP_HANDLES
+        from canvas.resize import anchor_point, resized_rect
+
+        rect = self.resize_rect()
+        if rect.width() <= 0 or rect.height() <= 0:
+            return
+        target = resized_rect(rect, index, point, keep_aspect)
+
+        factors = []
+        if index in LEFT_HANDLES or index in RIGHT_HANDLES:
+            factors.append(target.width() / rect.width())
+        if index in TOP_HANDLES or index in BOTTOM_HANDLES:
+            factors.append(target.height() / rect.height())
+        factor = max(factors) if factors else 1.0
+
+        font = self.font()
+        old_size = max(6, font.pixelSize())
+        new_size = int(max(6, min(400, round(old_size * factor))))
+        if new_size == old_size:
+            return
+        # 用取整后的字号反算真实倍数，保证锚点算得准
+        actual = new_size / float(old_size)
+
+        anchor = anchor_point(rect, index)
+        origin = self.pos()
+        self.setPos(QPointF(anchor.x() - (anchor.x() - origin.x()) * actual,
+                            anchor.y() - (anchor.y() - origin.y()) * actual))
+        font.setPixelSize(new_size)
+        self.setFont(font)
+        if self._wrap:
+            self._text_width = max(20.0, self._text_width * actual)
+            self._apply_wrap()
+        self.update()
+
     def to_dict(self) -> dict:
         font = self.font()
         return {
@@ -722,12 +851,60 @@ class TextItem(QGraphicsTextItem):
 
 
 class ImageItem(QGraphicsPixmapItem):
+    """导入的图片：可自由伸缩（四边拉伸 / 四角等比）。
+
+    原始位图保持不变，显示尺寸靠 ``QTransform`` 的缩放（``sx`` / ``sy``）实现，
+    所以放大不会丢像素、缩小也不破坏原图；缩放比例会写进 ``.wbd``。
+    """
+
     TYPE = "image"
+    MIN_SCALE = 0.02
+    MAX_SCALE = 50.0
 
     def __init__(self, pixmap: QPixmap):
         super().__init__(pixmap)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
         self.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
+
+    # ---------------------------------------------------------- 自由伸缩
+    def is_resizable(self) -> bool:
+        return True
+
+    def resize_rect(self) -> QRectF:
+        """当前显示区域（场景坐标）。"""
+        return self.mapRectToScene(QRectF(self.pixmap().rect()))
+
+    def resize_state(self) -> dict:
+        transform = self.transform()
+        return {
+            "sx": round(transform.m11(), 6),
+            "sy": round(transform.m22(), 6),
+            "pos": [self.pos().x(), self.pos().y()],
+        }
+
+    def restore_resize_state(self, state: dict) -> None:
+        self.setTransform(QTransform.fromScale(float(state.get("sx", 1.0)),
+                                               float(state.get("sy", 1.0))))
+        pos = state.get("pos")
+        if pos:
+            self.setPos(QPointF(pos[0], pos[1]))
+
+    def resize_with(self, index: int, point: QPointF, keep_aspect: bool = False) -> None:
+        from canvas.resize import resized_rect
+
+        rect = self.resize_rect()
+        target = resized_rect(rect, index, point, keep_aspect)
+        pixmap_rect = self.pixmap().rect()
+        if pixmap_rect.width() <= 0 or pixmap_rect.height() <= 0:
+            return
+        sx = target.width() / pixmap_rect.width()
+        sy = target.height() / pixmap_rect.height()
+        sx = max(self.MIN_SCALE, min(self.MAX_SCALE, sx))
+        sy = max(self.MIN_SCALE, min(self.MAX_SCALE, sy))
+        self.prepareGeometryChange()
+        self.setTransform(QTransform.fromScale(sx, sy))
+        self.setPos(target.topLeft())
+        self.update()
 
     def to_dict(self) -> dict:
         image = self.pixmap().toImage()
@@ -738,12 +915,15 @@ class ImageItem(QGraphicsPixmapItem):
         buf.open(QIODevice.OpenModeFlag.WriteOnly)
         image.save(buf, "PNG")
         buf.close()
+        transform = self.transform()
         return {
             "type": self.TYPE,
             "pos": [self.pos().x(), self.pos().y()],
             "data": bytes(ba.toBase64()).decode("ascii"),
             "w": self.pixmap().width(),
             "h": self.pixmap().height(),
+            "sx": round(transform.m11(), 6),
+            "sy": round(transform.m22(), 6),
         }
 
     @classmethod
@@ -752,6 +932,8 @@ class ImageItem(QGraphicsPixmapItem):
         pix = QPixmap()
         pix.loadFromData(raw, "PNG")
         item = cls(pix)
+        item.setTransform(QTransform.fromScale(float(data.get("sx", 1.0)),
+                                               float(data.get("sy", 1.0))))
         pos = data.get("pos")
         if pos:
             item.setPos(QPointF(pos[0], pos[1]))

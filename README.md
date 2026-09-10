@@ -87,8 +87,8 @@ whiteboard/
 │   ├── check_icons.py       # 图标自检：贴边裁切/空白/被拉伸 + 生成总览图
 │   └── icon_ascii.py        # 在终端用 ASCII 点阵“看”图标（排查线条断裂）
 ├── tests/
-│   ├── test_core.py         # 31 项核心逻辑单元测试（无需 pytest）
-│   └── smoke_test.py        # 91 项端到端冒烟测试（offscreen，无需显示器）
+│   ├── test_core.py         # 35 项核心逻辑单元测试（无需 pytest）
+│   └── smoke_test.py        # 102 项端到端冒烟测试（offscreen，无需显示器）
 └── docs/                    # 截图与图标总览图
 ```
 
@@ -106,6 +106,7 @@ whiteboard/
 | 线宽/颜色    | 工具栏「颜色」按钮与「粗细」滑块（作用范围随工具而定；文字字号在文字对话框里单独设置）                                                       |
 | 橡皮擦       | 拖动擦掉经过的**笔迹片段**（擦断，不是整条删除）；形状/文字/图片被碰到时整体删除；光标处会显示作用范围圆圈，大小随「粗细」滑块调整           |
 | 选择/移动    | 选择工具：点击选中、Ctrl 多选、空白处拖拽框选；拖动整体移动                                                                                  |
+| 缩放对象     | 选中**图片**或**文字**后会出现 8 个手柄：拖四角等比缩放、拖四边自由拉伸（图片可拉扁；文字按主方向改字号），按住 `Shift` 强制等比；缩放可撤销 |
 | 缩放         | 鼠标滚轮（以光标为中心）；`+`/`-`、`Ctrl+0` 适应窗口、`Ctrl+1` 实际大小                                                                      |
 | 撤销/重做    | `Ctrl+Z` / `Ctrl+Y`（或 `Ctrl+Shift+Z`）；一次擦除拖拽 = 一个撤销步骤                                                                        |
 | 删除         | 选择工具选中后按`Delete`                                                                                                                     |
@@ -149,6 +150,20 @@ whiteboard/
   自定义图形项自己实现 `boundingRect()`（`pen_bounds`）：
   Qt 6.11 的 `QGraphicsPathItem` 会在路径外多留约 1.5 倍线宽，
   用它会让导出的 PNG 四周留白比设定边距多几像素。
+- **虚线相位（擦断不跳位）**：虚线图案是从**路径起点**开始排的，
+  所以笔迹被擦断后重新生成碎片时，图案会在断口处重新起头 ——
+  断口之后的虚线整段移位，看起来像笔迹往回缩了一截。
+  正解是给碎片记住「从原笔迹起点算起的弧长」（`core.stroke.cumulative_lengths`），
+  写进 `QPen.setDashOffset()`。**注意这个 API 的单位是线宽**（和 `setDashPattern`
+  一致），直接传像素会得到完全错误的相位；而且设过它之后画笔样式会变成
+  `CustomDashLine`，所以线型要单独记在 `StrokeItem.line_style()` 上，
+  不能再靠 `pen().style()` 反推。
+- **图片/文字的自由伸缩**：`canvas/resize.py` 只算几何（8 个手柄的新矩形、
+  对角锚点、最小尺寸），应用到图形项上由各自实现 ——
+  图片改 `QTransform` 的缩放比（原图不变，缩放比写进 `.wbd`），
+  文字按主方向改字号（勾了自动换行时折行宽度一起缩放）。
+  手柄画在**视口叠加层**（不进文件、不进导出的 PNG），命中测试在视口坐标里做，
+  这样手柄的抓取范围与画布缩放无关。缩放结果通过 `ResizeItemCommand` 进撤销栈。
 - **文字与字体**：排版参数集中在 `core/text_format.py` 的 `TextFormat`
   （字体/字号/颜色/粗斜体/对齐/自动换行宽度），对话框、图形项、设置文件
   三处共用同一份定义。自动换行 = `QGraphicsTextItem.setTextWidth(w)`，
@@ -184,7 +199,7 @@ UTF-8 JSON 文本，可读、可手工编辑、可版本管理：
   "pages": [
     {"name": "页面 1", "items": [
       {"type": "stroke", "color": [0,0,0,255], "thickness": 2.0,
-       "line_style": "dash",
+       "line_style": "dash", "dash_offset": 42.5,
        "points": [[100.0, 200.0], [104.0, 208.0]], "pos": [0.0, 0.0]},
       {"type": "rect", "kind": "round_rect", "x": 40, "y": 60, "w": 200, "h": 120,
        "radius": 21.6, "line_style": "dash", "outline": [0,0,0,255],
@@ -197,6 +212,8 @@ UTF-8 JSON 文本，可读、可手工编辑、可版本管理：
        "pixel_size": 24, "bold": false, "italic": false,
        "wrap": true, "text_width": 300, "align": "left",
        "color": [0,0,0,255], "pos": [400.0, 500.0]}
+      {"type": "image", "w": 800, "h": 600, "sx": 0.5, "sy": 0.5,
+       "data": "<PNG 的 base64>", "pos": [120.0, 240.0]}
     ]}
   ]
 }
@@ -204,7 +221,9 @@ UTF-8 JSON 文本，可读、可手工编辑、可版本管理：
 
 各字段含义：`line_style` ∈ `solid|dash|dot|dash_dot`；
 `arrow` ∈ `none|end|both`（旧文件里的布尔值 `true/false` 也兼容）；
-`kind` 对矩形是 `rect|round_rect`、对多边形是 `triangle|diamond|star`。
+`kind` 对矩形是 `rect|round_rect`、对多边形是 `triangle|diamond|star`；
+`dash_offset` 是虚线相位（擦断后保持图案连续用，单位是场景坐标）；
+`sx`/`sy` 是图片的显示缩放比（原图数据不变，只是显示尺寸）。
 新增字段都带默认值，所以**旧版本的 .wbd 文件可以直接打开**。
 
 写入采用「临时文件 + `os.replace`」的原子方式，中途断电不会损坏原文件。
@@ -267,12 +286,12 @@ python scripts/cleanup.py --legacy-only    # 只清旧版遗留（注册表 + �
 ## 7. 测试
 
 ```bash
-# 核心逻辑单元测试（笔画/擦除切分/形状与线型/文字排版/字体导入/序列化/撤销命令）
-python tests/test_core.py            # 31/31
+# 核心逻辑单元测试（笔画/擦除切分/形状与线型/文字排版/字体导入/缩放/序列化/撤销命令）
+python tests/test_core.py            # 35/35
 
 # 端到端冒烟测试：画笔→撤销→形状（11 种）→虚线→橡皮擦断→框选→拖动→文字排版
-#                 →导入图片→多页面→存取→导出 PNG→主题
-python tests/smoke_test.py           # 91/91
+#                 →导入图片→图片/文字自由伸缩→多页面→存取→导出 PNG→主题
+python tests/smoke_test.py           # 102/102
 ```
 
 两个脚本都会自动使用 `QT_QPA_PLATFORM=offscreen`，无需真实显示器，

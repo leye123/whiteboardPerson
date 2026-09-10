@@ -195,6 +195,35 @@ class TextFormatCommand(QUndoCommand):
         self._apply(self._old_text, self._old_format)
 
 
+# ------------------------------------------------------------------ 缩放
+
+
+class ResizeItemCommand(QUndoCommand):
+    """缩放图片/文字（拖手柄时的结果，可撤销）。
+
+    命令构造时**不**改动画布：旧状态在构造时快照，新状态由调用方传入
+    （拖拽过程中已经实时生效了），``redo`` 相当于「再应用一次新状态」。
+    """
+
+    def __init__(self, item, old_state: dict, new_state: dict,
+                 text: str = "缩放", parent=None) -> None:
+        super().__init__(text, parent)
+        self._item = item
+        self._old = dict(old_state or {})
+        self._new = dict(new_state or {})
+
+    def _apply(self, state: dict) -> None:
+        if self._item is None or not state:
+            return
+        self._item.restore_resize_state(state)
+
+    def redo(self) -> None:
+        self._apply(self._new)
+
+    def undo(self) -> None:
+        self._apply(self._old)
+
+
 # ------------------------------------------------------------------ 工具函数
 
 

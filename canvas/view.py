@@ -12,6 +12,8 @@ from PySide6.QtCore import QPointF, QRect, QRectF, Qt, Signal
 from PySide6.QtGui import QColor, QPainter, QPen, QRegion, QWheelEvent
 from PySide6.QtWidgets import QGraphicsView
 
+from canvas import resize
+
 ZOOM_STEP = 1.2
 ZOOM_MIN = 0.05
 ZOOM_MAX = 20.0
@@ -280,11 +282,14 @@ class WhiteboardView(QGraphicsView):
 
         选中框画在视口叠加层上（不是图形项），Qt 的增量重绘不会刷新它，
         所以必须自己失效对应区域，否则框选/取消选中/移动之后框会留在屏幕上。
+        外扩的量要盖住缩放手柄（手柄画在框线上，向两侧各伸出半个手柄）。
         """
+        margin = resize.HANDLE_SIZE_PX
         dirty = QRegion()
         for box in getattr(self, "_selection_boxes", set()) | boxes:
-            dirty += QRegion(QRect(int(box[0]) - 2, int(box[1]) - 2,
-                                   int(box[2]) + 5, int(box[3]) + 5))
+            dirty += QRegion(QRect(int(box[0]) - margin, int(box[1]) - margin,
+                                   int(box[2]) + margin * 2 + 1,
+                                   int(box[3]) + margin * 2 + 1))
         self._selection_boxes = boxes
         self._last_dirty_region = dirty          # 便于自检/排查
         if not dirty.isEmpty():
@@ -304,6 +309,40 @@ class WhiteboardView(QGraphicsView):
                 scene is None or not scene.selectedItems()):
             return
         self._invalidate_selection_boxes(self._selection_boxes_now())
+
+    # ------------------------------------------------------------- 缩放手柄
+    def resize_target(self):
+        """当前可缩放的图形项（只选中一个、且它支持缩放时）。"""
+        scene = self.scene()
+        if scene is None:
+            return None
+        selected = [it for it in scene.selectedItems()
+                    if it.isVisible() and getattr(it, "is_resizable", None)
+                    and it.is_resizable()]
+        return selected[0] if len(selected) == 1 else None
+
+    def selection_view_rect(self, item) -> QRect:
+        """图形项外框的视口矩形（缩放手柄按它摆放）。"""
+        return self._selection_view_rect(item)
+
+    def handle_points_view(self) -> list:
+        """当前缩放手柄的视口坐标（顺序见 canvas.resize）。"""
+        item = self.resize_target()
+        if item is None:
+            return []
+        return [QPointF(point) for point in
+                resize.handle_points(QRectF(self._selection_view_rect(item)))]
+
+    def handle_at(self, viewport_pos) -> int:
+        """命中测试：鼠标是否落在某个缩放手柄上（是则返回编号，否则 None）。"""
+        item = self.resize_target()
+        if item is None:
+            return None
+        rect = QRectF(self._selection_view_rect(item))
+        return resize.handle_at(rect, viewport_pos)
+
+    def handle_cursor(self, index) -> Qt.CursorShape:
+        return resize.CURSORS.get(index, Qt.CursorShape.ArrowCursor)
 
     # ------------------------------------------------------------- 视口叠加层
     def set_overlay_circle(self, center: QPointF = None, radius: float = 0.0) -> None:
@@ -339,6 +378,7 @@ class WhiteboardView(QGraphicsView):
         painter = QPainter(self.viewport())
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         self._draw_selection_boxes(painter)
+        self._draw_resize_handles(painter)
         self._draw_tool_overlay(painter)
         painter.end()
 
@@ -364,6 +404,26 @@ class WhiteboardView(QGraphicsView):
         painter.setBrush(Qt.BrushStyle.NoBrush)
         for item in selected:
             painter.drawRect(self._selection_view_rect(item))
+        painter.restore()
+
+    def _draw_resize_handles(self, painter: QPainter) -> None:
+        """给「可缩放的选中项」画 8 个手柄（图片 / 文字）。
+
+        只选中一个可缩放对象时出现；形状/笔迹没有手柄（它们的尺寸靠重新绘制）。
+        画在视口叠加层：不进 .wbd、不会出现在导出的 PNG 里。
+        """
+        points = self.handle_points_view()
+        if not points:
+            return
+        half = resize.HANDLE_SIZE_PX / 2.0
+        pen = QPen(QColor(38, 132, 255, 230), 1.0)
+        pen.setCosmetic(True)
+        painter.save()
+        painter.setPen(pen)
+        painter.setBrush(QColor(255, 255, 255, 240))
+        for point in points:
+            painter.drawRect(QRectF(point.x() - half, point.y() - half,
+                                    resize.HANDLE_SIZE_PX, resize.HANDLE_SIZE_PX))
         painter.restore()
 
     def _draw_tool_overlay(self, painter: QPainter) -> None:

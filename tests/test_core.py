@@ -951,6 +951,7 @@ def test_pen_stroke_line_style_and_eraser_keeps_it():
     points = [QPointF(float(index), 0.0) for index in range(11)]
     item = StrokeItem(points, QColor(0, 0, 0), 2.0, line_style="dot")
     assert line_style_name(item.pen().style()) == "dot"
+    assert item.line_style() == "dot"
 
     clone = _roundtrip(item)
     assert clone.to_dict()["line_style"] == "dot"
@@ -969,7 +970,8 @@ def test_pen_stroke_line_style_and_eraser_keeps_it():
     tool._split_stroke(item, QPointF(5.0, 0.0), 1.5, scene)
     assert len(tool._added) == 2, "擦中间应当断成两段"
     for segment in tool._added:
-        assert line_style_name(segment.pen().style()) == "dot"
+        # 注意用 line_style()：设过虚线相位后 pen().style() 会变成 CustomDashLine
+        assert segment.line_style() == "dot"
         assert segment.pen().widthF() == 2.0
 
     # 真的画出来验一眼：水平虚线的中心扫描线应当断成多段，实线只有一段
@@ -994,6 +996,189 @@ def test_pen_stroke_line_style_and_eraser_keeps_it():
         StrokeItem(horizontal, QColor(0, 0, 0), 2.0)) == 1
     assert runs_on_center_row(
         StrokeItem(horizontal, QColor(0, 0, 0), 2.0, line_style="dash")) >= 4
+
+
+def _ink_columns(items, width=460, height=140, offset=(30, 70)) -> set:
+    """把图形项渲染出来，返回所有「有墨迹」的列号（场景坐标 x 取整）。"""
+    from PySide6.QtWidgets import QStyleOptionGraphicsItem
+
+    image = QImage(width, height, QImage.Format.Format_ARGB32)
+    image.fill(QColor(255, 255, 255))
+    painter = QPainter(image)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    painter.translate(*offset)
+    option = QStyleOptionGraphicsItem()
+    for item in items:
+        item.paint(painter, option, None)
+    painter.end()
+    columns = set()
+    for y in range(height):
+        for x in range(width):
+            if image.pixelColor(x, y).lightness() < 200:
+                columns.add(int(x - offset[0]))
+    return columns
+
+
+def test_erasing_dashed_stroke_keeps_dash_phase():
+    """橡皮擦擦断虚线笔迹后，别处的虚线不能跳位。
+
+    碎片是重新创建的图形项，如果不管虚线相位（dash offset），
+    虚线图案会从碎片起点重新开始 —— 于是「擦一下，后面整条虚线的墨迹都移位了」，
+    看起来就像笔迹往后退了一截。这里用渲染出的墨迹列集合来卡这一点。
+    """
+    import math
+
+    from tools.eraser_tool import EraserTool
+
+    # 采样点按真实画笔的密度（约 1.5px 一个点）：折线长度≈弧长，
+    # 虚线相位才能精确恢复。
+    points = [QPointF(index * 1.5, 25.0 * math.sin(index / 24.0))
+              for index in range(240)]
+    original = StrokeItem(points, QColor(0, 0, 0), 4.0, line_style="dash")
+    before = _ink_columns([original])
+
+    scene = WhiteboardScene()
+    scene.addItem(original)
+    tool = EraserTool()
+    radius = 18.0
+    tool._split_stroke(original, points[120], radius, scene)
+    assert len(tool._added) == 2
+    after = _ink_columns(tool._added)
+
+    center_x = points[120].x()
+    window = radius + 12.0
+    gained = {x for x in after if x not in before}
+    lost = {x for x in before if x not in after}
+    assert not gained, (
+        "擦断后不应凭空多出墨迹（说明虚线相位断了）："
+        f"{sorted(gained)[:12]}")
+    assert all(abs(x - center_x) <= window for x in lost), (
+        f"只有橡皮附近该掉墨，实际掉墨范围 "
+        f"{min(lost) if lost else '-'}~{max(lost) if lost else '-'}，"
+        f"橡皮在 {center_x:.0f}±{window:.0f}")
+
+
+def test_resize_handle_geometry():
+    """手柄几何：四角等比、四边自由、锚点不动、有最小尺寸。"""
+    from canvas.resize import (BOTTOM_RIGHT, LEFT, MIN_SIZE, RIGHT, TOP_LEFT,
+                               anchor_point, handle_at, handle_points, resized_rect)
+
+    rect = QRectF(100.0, 100.0, 200.0, 100.0)
+    points = handle_points(rect)
+    assert len(points) == 8
+    assert points[0] == QPointF(100.0, 100.0)          # 左上
+    assert points[4] == QPointF(300.0, 200.0)          # 右下
+    assert points[3] == QPointF(300.0, 150.0)          # 右边中点
+    assert anchor_point(rect, TOP_LEFT) == QPointF(300.0, 200.0)
+
+    # 四边拉伸：只改一个方向，另一边不动
+    stretched = resized_rect(rect, RIGHT, QPointF(500.0, 999.0))
+    assert stretched.left() == 100.0 and stretched.top() == 100.0
+    assert abs(stretched.width() - 400.0) < 0.001
+    assert abs(stretched.height() - 100.0) < 0.001
+
+    # 四角等比：宽高比保持，对角（左上）不动，且缩放后的框包住鼠标位置
+    cursor = QPointF(500.0, 400.0)
+    grown = resized_rect(rect, BOTTOM_RIGHT, cursor, keep_aspect=True)
+    assert abs(grown.left() - 100.0) < 0.001 and abs(grown.top() - 100.0) < 0.001
+    assert abs(grown.width() / grown.height() - 2.0) < 0.001
+    assert grown.contains(cursor)
+    # 主导方向是纵向（300/100 = 3 > 400/200 = 2）-> 600x300
+    assert abs(grown.width() - 600.0) < 0.001 and abs(grown.height() - 300.0) < 0.001
+
+    # 往反方向拖过头 -> 夹到最小尺寸，不会翻转成负尺寸
+    tiny = resized_rect(rect, RIGHT, QPointF(-500.0, 150.0))
+    assert tiny.width() >= MIN_SIZE - 0.001
+    flipped = resized_rect(rect, LEFT, QPointF(500.0, 150.0))
+    assert flipped.width() >= MIN_SIZE - 0.001
+
+    # 命中测试（视口坐标，容差 7px）
+    assert handle_at(rect, QPointF(300.0, 200.0)) == 4
+    assert handle_at(rect, QPointF(305.0, 203.0)) == 4
+    assert handle_at(rect, QPointF(200.0, 150.0)) is None
+
+
+def test_image_resize_and_roundtrip():
+    """图片：自由伸缩（含非等比拉伸）、缩放比例可存可读、可撤销。"""
+    from canvas.resize import BOTTOM_RIGHT, RIGHT
+    from core.history import ResizeItemCommand
+
+    pixmap = QPixmap(100, 50)
+    pixmap.fill(QColor(10, 20, 30))
+    item = ImageItem(pixmap)
+    item.setPos(QPointF(0.0, 0.0))
+    assert item.is_resizable()
+    assert abs(item.resize_rect().width() - 100.0) < 0.001
+
+    # 四边拉伸：横向拉长（非等比）
+    item.resize_with(RIGHT, QPointF(200.0, 0.0))
+    rect = item.resize_rect()
+    assert abs(rect.width() - 200.0) < 0.5 and abs(rect.height() - 50.0) < 0.5
+
+    # 四角等比
+    before = item.resize_rect()
+    item.resize_with(BOTTOM_RIGHT, QPointF(before.right() + 100.0,
+                                           before.bottom() + 50.0), keep_aspect=True)
+    after = item.resize_rect()
+    assert abs(after.width() / after.height() - before.width() / before.height()) < 0.01
+    assert abs(after.left() - before.left()) < 0.5      # 左上角不动
+
+    # 序列化：缩放比例与位置都要保留，图片数据还是原图
+    item.setPos(QPointF(40.0, 60.0))
+    data = item.to_dict()
+    assert data["w"] == 100 and data["h"] == 50
+    clone = ImageItem.from_dict(data)
+    assert clone.to_dict()["sx"] == data["sx"] and clone.to_dict()["sy"] == data["sy"]
+    assert abs(clone.resize_rect().width() - item.resize_rect().width()) < 0.5
+
+    # 撤销：回到缩放前的尺寸
+    state_before = item.resize_state()
+    item.resize_with(RIGHT, QPointF(item.resize_rect().right() + 300.0, 0.0))
+    state_after = item.resize_state()
+    assert state_after != state_before
+    stack = QUndoStack()
+    stack.push(ResizeItemCommand(item, state_before, state_after))
+    stack.undo()
+    assert item.resize_state() == state_before
+    stack.redo()
+    assert item.resize_state() == state_after
+
+
+def test_text_resize_scales_font_size():
+    """文字：拖手柄改字号（等比），勾了换行时折行宽度一起缩放。"""
+    from canvas.resize import BOTTOM_RIGHT, RIGHT
+
+    item = TextItem("缩放测试的文字内容", QColor(0, 0, 0), 20, wrap=True,
+                    text_width=200.0)
+    item.setPos(QPointF(50.0, 50.0))
+    assert item.is_resizable()
+    rect = item.resize_rect()
+    assert rect.width() > 1 and rect.height() > 1
+
+    # 右边手柄：横向拖到 1.5 倍 -> 字号与折行宽度都放大
+    target_x = rect.left() + rect.width() * 1.5
+    item.resize_with(RIGHT, QPointF(target_x, rect.center().y()), keep_aspect=True)
+    assert item.font().pixelSize() > 20
+    assert item.text_width() > 200.0
+    assert item.font().pixelSize() <= 400
+    # 位置锚点：右边手柄的锚点是左边，左边应当基本不动
+    assert abs(item.pos().x() - 50.0) < 1.5
+
+    # 缩小：字号跟着变小，但不会低于下限
+    item.resize_with(RIGHT, QPointF(item.pos().x() + 5.0, rect.center().y()),
+                     keep_aspect=True)
+    assert item.font().pixelSize() >= 6
+
+    # 缩放状态可存可读（撤销用）
+    state = item.resize_state()
+    assert set(state) == {"pixel_size", "text_width", "pos"}
+    item.restore_resize_state({"pixel_size": 30, "text_width": 150.0,
+                              "pos": [10.0, 20.0]})
+    assert item.font().pixelSize() == 30
+    assert abs(item.text_width() - 150.0) < 0.01
+    assert item.pos() == QPointF(10.0, 20.0)
+    item.restore_resize_state(state)
+    assert item.font().pixelSize() == state["pixel_size"]
 
 
 # ------------------------------------------------------------------ 运行器

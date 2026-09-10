@@ -117,6 +117,23 @@ def split_by_eraser(points: Sequence[QPointF], center: QPointF, radius: float,
     return runs
 
 
+def cumulative_lengths(points: Sequence[QPointF]) -> List[float]:
+    """每个采样点到起点的折线长度（``lengths[i]`` 对应 ``points[i]``）。
+
+    用途：橡皮擦把一条**虚线**笔迹擦断后，碎片是新的图形项 ——
+    如果不告诉它「从原笔迹多长的地方开始」，虚线图案会从碎片起点重新开始，
+    于是断口之后的虚线整段移位（看起来像笔迹往回缩了一截）。
+    把这段累计长度写进画笔的 ``dashOffset`` 就能保持相位连续。
+
+    采样点足够密（画笔按屏幕像素采样）时折线长度与真实弧长差别可忽略。
+    """
+    lengths: List[float] = [0.0]
+    for a, b in zip(points, points[1:]):
+        dx, dy = b.x() - a.x(), b.y() - a.y()
+        lengths.append(lengths[-1] + (dx * dx + dy * dy) ** 0.5)
+    return lengths
+
+
 # ------------------------------------------------------------------ 笔画模型
 
 

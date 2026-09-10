@@ -618,6 +618,103 @@ def main() -> int:
     win.import_image()
     ok(len(warnings_seen) == 1, "读到非法图片时给出明确提示（而不是静默失败）")
 
+    # ---- 18. 图片可自由伸缩（拖手柄 + 撤销）
+    scene = win.view.scene()
+    images = [it for it in scene.items() if isinstance(it, ImageItem)]
+    ok(bool(images), "场景里有导入的图片")
+    image = images[0]
+    scene.clearSelection()
+    win.set_active_tool("selector")
+    image.setSelected(True)
+    app.processEvents()
+    ok(win.view.resize_target() is image, "选中图片后出现缩放手柄")
+    handles = win.view.handle_points_view()
+    ok(len(handles) == 8, f"图片有 8 个缩放手柄（实际 {len(handles)}）")
+    rect_before = image.resize_rect()
+    corner = handles[4]                       # 右下手柄
+    drag(vp, QPoint(int(corner.x()), int(corner.y())),
+         [QPoint(int(corner.x()) + 40, int(corner.y()) + 20),
+          QPoint(int(corner.x()) + 80, int(corner.y()) + 40)])
+    app.processEvents()
+    rect_after = image.resize_rect()
+    ok(rect_after.width() > rect_before.width() + 20,
+       f"拖右下手柄把图片拉大了（{rect_before.width():.0f} -> "
+       f"{rect_after.width():.0f}）")
+    ok(abs(rect_after.left() - rect_before.left()) < 1.5,
+       "四角缩放时对角（左上）保持不动")
+    win.undo_stack.undo()
+    app.processEvents()
+    ok(abs(image.resize_rect().width() - rect_before.width()) < 0.5,
+       "图片缩放可撤销")
+
+    # ---- 18b. 文字可自由伸缩（拖手柄改字号 + 撤销）
+    scene = fresh_scene()
+    TextDialog.ask = staticmethod(
+        lambda *a, **k: ("可缩放的文字内容", TextFormat(pixel_size=20)))
+    win.set_active_tool("text")
+    click(vp, QPoint(400, 300))
+    app.processEvents()
+    text_item = [it for it in scene.items() if isinstance(it, TextItem)][0]
+    win.set_active_tool("selector")
+    scene.clearSelection()
+    text_item.setSelected(True)
+    app.processEvents()
+    ok(win.view.resize_target() is text_item, "选中文字后出现缩放手柄")
+    size_before = text_item.font().pixelSize()
+    corner = win.view.handle_points_view()[4]
+    drag(vp, QPoint(int(corner.x()), int(corner.y())),
+         [QPoint(int(corner.x()) + 60, int(corner.y()) + 30)])
+    app.processEvents()
+    ok(text_item.font().pixelSize() > size_before,
+       f"拖手柄把字号放大（{size_before} -> {text_item.font().pixelSize()}）")
+    win.undo_stack.undo()
+    app.processEvents()
+    ok(text_item.font().pixelSize() == size_before, "文字缩放可撤销")
+
+    # ---- 18c. 笔迹/形状没有缩放手柄（尺寸靠重新绘制）
+    scene = fresh_scene()
+    win.set_active_tool("pen")
+    drag(vp, QPoint(200, 200), [QPoint(260, 240)])
+    app.processEvents()
+    win.set_active_tool("selector")
+    stroke_item = [it for it in scene.items() if isinstance(it, StrokeItem)][0]
+    stroke_item.setSelected(True)
+    app.processEvents()
+    ok(win.view.resize_target() is None and win.view.handle_points_view() == [],
+       "笔迹与形状不显示缩放手柄")
+
+    # ---- 18d. 手柄真的画出来了（叠加层绘制路径）
+    scene = fresh_scene()
+    img_path2 = os.path.join(_tmp, "resize_sample.png")
+    sample2 = QImage(80, 60, QImage.Format.Format_ARGB32)
+    sample2.fill(QColor("#2f9e6f"))
+    sample2.save(img_path2)
+    QFileDialog.getOpenFileName = staticmethod(lambda *a, **k: (img_path2, ""))
+    win.import_image()
+    app.processEvents()
+    resized_image = [it for it in scene.items() if isinstance(it, ImageItem)][0]
+    scene.clearSelection()
+    resized_image.setSelected(True)
+    app.processEvents()
+    shot = win.view.viewport().grab().toImage()
+    drawn = 0
+    for handle in win.view.handle_points_view():
+        found = False
+        for dx in range(-5, 6):
+            for dy in range(-5, 6):
+                x, y = int(handle.x()) + dx, int(handle.y()) + dy
+                if not (0 <= x < shot.width() and 0 <= y < shot.height()):
+                    continue
+                color = shot.pixelColor(x, y)
+                # 手柄边框是蓝色（#2684ff 附近），白底画布上没有这种颜色
+                if color.blue() > 150 and color.blue() - color.red() > 60:
+                    found = True
+                    break
+            if found:
+                break
+        drawn += 1 if found else 0
+    ok(drawn >= 6, f"缩放手柄真的画在视口上（识别到 {drawn}/8 个）")
+
     print(f"\n全部 {checks} 项冒烟检查通过")
     return 0
 
