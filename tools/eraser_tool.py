@@ -19,13 +19,22 @@ from __future__ import annotations
 
 from PySide6.QtCore import QPointF, Qt
 
-from canvas.items import EllipseItem, LineItem, RectItem, StrokeItem, is_preview
+from canvas.items import (
+    EllipseItem,
+    ImageItem,
+    LineItem,
+    PolygonShapeItem,
+    RectItem,
+    StrokeItem,
+    TextItem,
+    is_preview,
+)
 from core.history import ReplaceItemsCommand
 from core.stroke import split_by_eraser
 from tools.base_tool import BaseTool
 
-# 无法擦断、只能整体删除的图形（文字/图片同理）
-_WHOLE_ERASE = (LineItem, RectItem, EllipseItem)
+# 无法擦断、只能整体删除的图形（形状/文字/图片都属此类）
+_WHOLE_ERASE = (LineItem, RectItem, EllipseItem, PolygonShapeItem, TextItem, ImageItem)
 # 擦断后少于这个点数的碎片直接丢弃（1 个点只剩个圆点，没有保留价值）
 MIN_SEGMENT_POINTS = 2
 

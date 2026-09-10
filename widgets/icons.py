@@ -28,8 +28,10 @@ from typing import Callable, Dict, Iterable, Tuple
 
 from PySide6.QtCore import QPointF, QRectF, Qt
 from PySide6.QtGui import (
+    QBrush,
     QColor,
     QIcon,
+    QImage,
     QPainter,
     QPainterPath,
     QPen,
@@ -112,6 +114,27 @@ def _arc(p: QPainter, rect: QRectF, start_deg: float, sweep_deg: float) -> None:
     _path(p, build)
 
 
+def _dashed(p: QPainter, style: str = "dash") -> None:
+    """把当前画笔换成对应线型（画「线型」预览图标用）。
+
+    注意要 ``setPen`` 一个新 QPen：直接改 ``p.pen()`` 返回的副本是没用的。
+    """
+    pen = p.pen()
+    pen.setStyle({
+        "dash": Qt.PenStyle.DashLine,
+        "dot": Qt.PenStyle.DotLine,
+        "dash_dot": Qt.PenStyle.DashDotLine,
+    }.get(style, Qt.PenStyle.SolidLine))
+    # 图标里的线很细，用自定义虚线才看得出「虚」的节奏
+    if style == "dash":
+        pen.setDashPattern([2.4, 1.6])
+    elif style == "dot":
+        pen.setDashPattern([0.9, 1.5])
+    elif style == "dash_dot":
+        pen.setDashPattern([2.6, 1.4, 0.9, 1.4])
+    p.setPen(pen)
+
+
 def _head(p: QPainter, tip: Tuple[float, float], direction: Tuple[float, float],
           length: float = 4.2, width: float = 3.0) -> None:
     """在 ``tip`` 处画一个指向 ``direction`` 的实心箭头。"""
@@ -179,17 +202,74 @@ def _rect_shape(p: QPainter) -> None:
     _rect(p, 3.6, 5.0, 12.8, 10.0, 1.4)
 
 
+def _round_rect_shape(p: QPainter) -> None:
+    """圆角矩形：圆角要足够大才看得出和普通矩形的区别。"""
+    _rect(p, 3.6, 5.0, 12.8, 10.0, 3.2)
+
+
 def _ellipse_shape(p: QPainter) -> None:
     _ellipse(p, 3.6, 5.0, 12.8, 10.0)
+
+
+def _triangle_shape(p: QPainter) -> None:
+    _poly(p, [(10.0, 4.2), (16.4, 15.8), (3.6, 15.8)], close=True)
+
+
+def _diamond_shape(p: QPainter) -> None:
+    _poly(p, [(10.0, 4.0), (16.4, 10.0), (10.0, 16.0), (3.6, 10.0)], close=True)
+
+
+def _star_shape(p: QPainter) -> None:
+    """五角星：内外半径比 0.42，顶点朝上。"""
+    cx, cy, rx, ry = 10.0, 10.0, 6.6, 6.8
+    points = []
+    for index in range(10):
+        factor = 1.0 if index % 2 == 0 else 0.42
+        angle = -math.pi / 2 + index * math.pi / 5
+        points.append((cx + rx * factor * math.cos(angle),
+                       cy + ry * factor * math.sin(angle)))
+    _poly(p, points, close=True)
 
 
 def _line_shape(p: QPainter) -> None:
     _line(p, 4.2, 15.8, 15.8, 4.2)
 
 
+def _dashed_line_shape(p: QPainter) -> None:
+    _dashed(p, "dash")
+    _line(p, 4.2, 15.8, 15.8, 4.2)
+
+
 def _arrow(p: QPainter) -> None:
     _line(p, 4.2, 15.8, 13.6, 6.4)
     _head(p, (16.2, 3.8), (1.0, -1.0), length=4.6, width=3.4)
+
+
+def _dashed_arrow(p: QPainter) -> None:
+    _dashed(p, "dash")
+    _line(p, 4.2, 15.8, 13.6, 6.4)
+    p.save()
+    _dashed(p, "solid")
+    _head(p, (16.2, 3.8), (1.0, -1.0), length=4.6, width=3.4)
+    p.restore()
+
+
+def _double_arrow(p: QPainter) -> None:
+    """双向箭头：一条斜线 + 两端箭头。"""
+    _line(p, 6.4, 13.6, 13.6, 6.4)
+    _head(p, (16.2, 3.8), (1.0, -1.0), length=4.6, width=3.4)
+    _head(p, (3.8, 16.2), (-1.0, 1.0), length=4.6, width=3.4)
+
+
+def _line_style_preview(style: str):
+    """生成「线型」下拉框的绘制函数（一条横向预览线）。"""
+    def draw(p: QPainter) -> None:
+        _dashed(p, style)
+        _line(p, 3.0, 10.0, 17.0, 10.0)
+        # 上下再各来一条短一点的，避免图标看起来太单薄
+        _line(p, 5.0, 6.4, 15.0, 6.4)
+        _line(p, 5.0, 13.6, 15.0, 13.6)
+    return draw
 
 
 def _pan(p: QPainter) -> None:
@@ -348,9 +428,20 @@ _DRAW: Dict[str, Callable[[QPainter], None]] = {
     "pen": _pen,
     "eraser": _eraser,
     "rect": _rect_shape,
+    "round_rect": _round_rect_shape,
     "ellipse": _ellipse_shape,
+    "triangle": _triangle_shape,
+    "diamond": _diamond_shape,
+    "star": _star_shape,
     "line": _line_shape,
+    "dashed_line": _dashed_line_shape,
     "arrow": _arrow,
+    "dashed_arrow": _dashed_arrow,
+    "double_arrow": _double_arrow,
+    "line_style_solid": _line_style_preview("solid"),
+    "line_style_dash": _line_style_preview("dash"),
+    "line_style_dot": _line_style_preview("dot"),
+    "line_style_dash_dot": _line_style_preview("dash_dot"),
     "text": _text,
     "select": _select,
     "undo": _undo,
@@ -418,23 +509,75 @@ def tool_icon(name: str, theme: str = "light", sizes: Tuple[int, ...] = None) ->
 
 def app_icon(theme: str = "light", sizes: Tuple[int, ...] = (16, 24, 32, 48, 64, 128, 256)) -> QIcon:
     """应用窗口图标：一块带笔迹的白板。"""
-    fg = FOREGROUND.get(theme, FOREGROUND["light"])
-    accent = ACCENT.get(theme, ACCENT["light"])
     icon = QIcon()
     for size in sizes:
-        pixmap = QPixmap(size, size)
-        pixmap.fill(Qt.GlobalColor.transparent)
-        painter = QPainter(pixmap)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        painter.scale(size / BOX, size / BOX)
-        painter.setPen(QPen(fg, 1.4))
-        painter.setBrush(Qt.BrushStyle.NoBrush)
-        _rect(painter, 1.8, 3.2, 16.4, 13.6, 2.0)
-        painter.setPen(QPen(accent, 1.9))
-        path = QPainterPath()
-        path.moveTo(4.6, 13.4)
-        path.cubicTo(7.4, 7.6, 10.6, 14.8, 15.4, 7.0)
-        painter.drawPath(path)
-        painter.end()
-        icon.addPixmap(pixmap)
+        icon.addPixmap(app_pixmap(size, theme))
     return icon
+
+
+def app_image(size: int, theme: str = "light") -> QImage:
+    """应用标志的位图（窗口图标与 .ico 生成共用同一份绘制代码）。"""
+    image = QImage(int(size), int(size), QImage.Format.Format_ARGB32)
+    image.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(image)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    painter.scale(size / BOX, size / BOX)
+    draw_app_mark(painter, theme)
+    painter.end()
+    return image
+
+
+def app_pixmap(size: int, theme: str = "light") -> QPixmap:
+    return QPixmap.fromImage(app_image(size, theme))
+
+
+# 应用标志里第二笔的颜色（绿），与主色（蓝）一起构成「写了两笔」的感觉
+ACCENT2 = {"light": QColor("#2f9e6f"), "dark": QColor("#63c08a")}
+BOARD_FILL = "#ffffff"
+
+
+def draw_app_mark(painter: QPainter, theme: str = "light") -> None:
+    """在 20x20 的坐标系里画应用标志（exe 图标与窗口图标共用）。
+
+    图标要点（都是小尺寸下的可读性考虑）：
+
+    * 一块**白色板面 + 深色描边**：浅色任务栏和深色任务栏上都能看清轮廓；
+    * 板面上两笔彩色笔迹（蓝 + 绿）：一眼看出这是「白板/写字」而不是空白方块；
+    * 所有元素留在安全区内，16px 下也不会被裁。
+
+    ``scripts/make_icon.py`` 用同一个函数生成 ``.ico``，
+    保证窗口图标和 exe 图标完全一致。
+    """
+    fg = FOREGROUND.get(theme, FOREGROUND["light"])
+    accent = ACCENT.get(theme, ACCENT["light"])
+    accent2 = ACCENT2.get(theme, ACCENT2["light"])
+
+    # 板面
+    painter.save()
+    border = QPen(fg, 1.3)
+    border.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+    painter.setPen(border)
+    painter.setBrush(QBrush(QColor(BOARD_FILL)))
+    painter.drawRoundedRect(QRectF(2.0, 3.0, 16.0, 14.0), 2.4, 2.4)
+    painter.restore()
+
+    # 第一笔：蓝色波浪线（手写感）
+    painter.save()
+    pen = QPen(accent, 2.0)
+    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    painter.setPen(pen)
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+    path = QPainterPath()
+    path.moveTo(5.6, 12.4)
+    path.cubicTo(8.2, 6.6, 11.2, 14.4, 14.4, 7.2)
+    painter.drawPath(path)
+    painter.restore()
+
+    # 第二笔：底部短横线
+    painter.save()
+    pen = QPen(accent2, 1.8)
+    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    painter.setPen(pen)
+    _line(painter, 6.4, 14.4, 12.2, 14.4)
+    painter.restore()
+

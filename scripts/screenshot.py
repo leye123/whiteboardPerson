@@ -35,38 +35,78 @@ from PySide6.QtCore import QPointF, QRectF, QTimer  # noqa: E402
 from PySide6.QtGui import QColor  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
-from canvas.items import EllipseItem, LineItem, RectItem, StrokeItem, TextItem  # noqa: E402
+from canvas.items import (  # noqa: E402
+    ARROW_BOTH,
+    ARROW_END,
+    EllipseItem,
+    LineItem,
+    PolygonShapeItem,
+    RectItem,
+    StrokeItem,
+    TextItem,
+    default_radius,
+)
 from main_window import MainWindow  # noqa: E402
 
 
 def _add_sample_content(win: MainWindow) -> None:
-    """往当前页塞一点示例内容，让截图有代表性。"""
+    """往当前页塞一点示例内容，让截图有代表性。
+
+    坐标按**当前可见区域**的相对比例算，而不是写死场景坐标 ——
+    视图启动时以场景原点为中心，写死的坐标很容易落到窗口外
+    （之前五角星就整个跑到可视区右边去了，截图上根本看不到）。
+    """
+    import math
+
     scene = win.view.scene()
+    view = win.view
+    area = view.mapToScene(view.viewport().rect()).boundingRect()
+    left, top = area.left(), area.top()
+    width, height = area.width(), area.height()
+
+    def box(fx: float, fy: float, fw: float, fh: float) -> QRectF:
+        return QRectF(left + width * fx, top + height * fy,
+                      width * fw, height * fh)
+
+    def point(fx: float, fy: float) -> QPointF:
+        return QPointF(left + width * fx, top + height * fy)
+
     ink = QColor("#1a4fb4")
     warm = QColor("#e2574c")
+    green = QColor("#2f9e6f")
+    orange = QColor("#e8912a")
+    dark = win._theme == "dark"
+    title_color = QColor("#e6e9ee") if dark else QColor("#1f2328")
+    note_color = QColor("#a9b1bb") if dark else QColor("#5b6169")
 
     # 手写笔迹：一段正弦曲线
     points = []
-    for i in range(90):
-        x = 120.0 + i * 7.0
-        y = 180.0 + 70.0 * __import__("math").sin(i / 9.0)
-        points.append(QPointF(x, y))
+    for index in range(90):
+        points.append(QPointF(left + width * (0.06 + 0.44 * index / 89.0),
+                              top + height * (0.34 + 0.09 * math.sin(index / 9.0))))
     scene.addItem(StrokeItem(points, ink, 3.0))
 
-    rect = RectItem(QRectF(140.0, 330.0, 240.0, 140.0), warm, 2.5)
-    scene.addItem(rect)
-    ellipse = EllipseItem(QRectF(430.0, 330.0, 220.0, 140.0), QColor("#2f9e6f"), 2.5)
-    scene.addItem(ellipse)
-    scene.addItem(LineItem(QPointF(700.0, 330.0), QPointF(880.0, 470.0), ink, 2.0))
-    scene.addItem(LineItem(QPointF(700.0, 470.0), QPointF(880.0, 330.0), warm, 2.0,
-                           arrow=True))
+    # 圆角矩形（圆角半径随尺寸自动算）/ 椭圆 / 五角星
+    rounded = box(0.06, 0.50, 0.20, 0.24)
+    scene.addItem(RectItem(rounded, warm, 2.5, radius=default_radius(rounded)))
+    scene.addItem(EllipseItem(box(0.30, 0.50, 0.18, 0.24), green, 2.5))
+    scene.addItem(PolygonShapeItem("star", box(0.52, 0.47, 0.16, 0.28), orange, 2.5))
 
-    title = TextItem("我的白板 · PySide6", QColor("#1f2328"), 34)
-    title.setPos(QPointF(140.0, 90.0))
+    # 虚线箭头 / 双向点线箭头
+    scene.addItem(LineItem(point(0.72, 0.53), point(0.94, 0.68), ink, 2.0,
+                           arrow=ARROW_END, line_style="dash"))
+    scene.addItem(LineItem(point(0.72, 0.72), point(0.94, 0.56), warm, 2.0,
+                           arrow=ARROW_BOTH, line_style="dot"))
+
+    title = TextItem("我的白板 · PySide6", title_color, 34)
+    title.setPos(point(0.06, 0.10))
     scene.addItem(title)
-    note = TextItem("画笔 · 橡皮 · 形状 · 文字 · 选择 · 多页面 · 撤销重做",
-                    QColor("#5b6169"), 18)
-    note.setPos(QPointF(140.0, 545.0))
+
+    # 自动换行的说明文字（折行宽度是排版参数之一）
+    note = TextItem("画笔 · 橡皮（擦断）· 11 种形状 · 文字（可导入字体）\n"
+                    "选择/框选 · 拖动画布 · 多页面 · 撤销重做 · PNG 导出",
+                    note_color, 18, wrap=True, text_width=width * 0.5)
+    note.setPos(point(0.06, 0.80))
     scene.addItem(note)
 
 
@@ -79,9 +119,13 @@ def main() -> int:
     width, height = (int(v) for v in args.size.lower().split("x"))
     win.resize(width, height)
     win._apply_theme(args.theme)
+    win.show()
+    # 必须先 show + 处理事件：show 之前 viewport 还没有真实尺寸，
+    # 按“可见区域”放置的示例内容会挤在一个 100×30 的角落里（截图上一小团）。
+    app.processEvents()
     if not args.no_content:
         _add_sample_content(win)
-    win.show()
+        app.processEvents()
 
     out = args.out or os.path.join(ROOT, "docs", f"screenshot_{args.theme}.png")
     os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)

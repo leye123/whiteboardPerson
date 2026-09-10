@@ -125,6 +125,25 @@ def make_asset(source: str, dry_run: bool = False) -> str:
     return target
 
 
+def verify_icon(source: str, dry_run: bool = False) -> bool:
+    """发布前确认 exe 里真的嵌了图标。
+
+    只打包不传 ``--icon`` 时程序照常运行，只有资源管理器/任务栏上显示默认图标，
+    很容易带着发布出去（实际就发生过）。这里在压缩之前顺手验一遍。
+    """
+    if dry_run:
+        print("  将核对 exe 图标")
+        return True
+    exe = find_exe(source) if os.path.isdir(source) else source
+    script = os.path.join(ROOT, "scripts", "check_exe_icon.py")
+    if not exe or not os.path.exists(script):
+        return True
+    if subprocess.call([sys.executable, script, exe], cwd=ROOT) != 0:
+        print("  警告：exe 图标检查未通过，发布包里的程序会显示默认图标")
+        return False
+    return True
+
+
 def git(*args: str, dry_run: bool = False) -> str:
     if dry_run:
         print("$ git", " ".join(args))
@@ -175,6 +194,7 @@ def main() -> int:
 
     print("[2/4] 生成发布资产")
     source = args.source or (find_artifact() if not args.dry_run else CANDIDATE_OUTPUTS[0])
+    verify_icon(source, dry_run=args.dry_run)
     archive = make_asset(source, dry_run=args.dry_run)
 
     print("[3/4] 打标签")

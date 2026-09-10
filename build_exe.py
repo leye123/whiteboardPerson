@@ -2,18 +2,20 @@
 
 默认使用 PyInstaller；加 ``--nuitka`` 改用 Nuitka（生成 C 代码，体积更小、启动更快）。
 
-    python build_exe.py              # PyInstaller -> dist/Whiteboard-1.0.0.exe
+    python build_exe.py              # PyInstaller -> dist/Whiteboard-1.1.0.exe
     python build_exe.py --nuitka     # Nuitka      -> build/nuitka/main.dist/
     python build_exe.py --onedir     # 目录形式（启动更快，便于排查）
 
 版本号来自 ``core/version.py``，会同时写进：
 
 * 可执行文件的 Windows 版本资源（右键属性→详细信息里能看到）；
-* 产物文件名（``Whiteboard-1.0.0.exe`` / ``Whiteboard-1.0.0-win64.zip``）；
+* 产物文件名（``Whiteboard-1.1.0.exe`` / ``Whiteboard-1.1.0-win64.zip``）；
 * ``scripts/release.py`` 创建的 Release 标签与资产名。
 
 注意：``resources/`` 里的 QSS 是运行时读取的，必须一起打包；
-图标是运行时用 QPainter 画的，不需要额外资源。
+**exe 的图标**用的 ``resources/icons/whiteboard.ico``（由 ``scripts/make_icon.py``
+生成）也一并打包，并通过 ``--icon`` / ``--windows-icon-from-ico`` 写进可执行文件
+的资源里 —— 少了这一步，exe 在资源管理器和任务栏上就只会显示默认图标。
 """
 from __future__ import annotations
 
@@ -40,12 +42,32 @@ NAME = PACKAGE_BASENAME                       # Whiteboard
 VERSION = __version__
 OUTPUT_EXE = f"{NAME}-{VERSION}.exe"          # 带上版本号，便于区分产物
 BUILD_DIR = os.path.join(ROOT, "build")
+ICON_PATH = os.path.join(ROOT, "resources", "icons", "whiteboard.ico")
+MAKE_ICON = os.path.join(ROOT, "scripts", "make_icon.py")
 SEP = ";" if os.name == "nt" else ":"
 
 
 def _run(cmd) -> int:
     print("$", " ".join(cmd), flush=True)
     return subprocess.call(cmd, cwd=ROOT)
+
+
+def ensure_icon() -> str:
+    """确保存在 ``resources/icons/whiteboard.ico``；缺失时现场生成。
+
+    返回图标路径；生成失败返回空串（打包继续，只是 exe 图标退回默认）。
+    """
+    if not os.path.exists(ICON_PATH):
+        print("未找到图标文件，先生成：", ICON_PATH)
+        try:
+            subprocess.call([sys.executable, MAKE_ICON], cwd=ROOT)
+        except OSError as exc:
+            print("生成图标失败：", exc)
+    if os.path.exists(ICON_PATH):
+        print(f"exe 图标：{ICON_PATH}（{os.path.getsize(ICON_PATH)} 字节）")
+        return ICON_PATH
+    print("警告：缺少 exe 图标，产物会使用默认图标")
+    return ""
 
 
 def _module_available(name: str) -> bool:
@@ -111,6 +133,7 @@ VSVersionInfo(
 def build_pyinstaller(onedir: bool, clean: bool) -> int:
     if not _check_tool("PyInstaller", "pyinstaller", "pyinstaller"):
         return 1
+    icon = ensure_icon()
     cmd = [
         sys.executable, "-m", "PyInstaller",
         "--noconfirm", "--windowed",
@@ -120,6 +143,8 @@ def build_pyinstaller(onedir: bool, clean: bool) -> int:
         "--exclude-module", "tkinter",
         "--exclude-module", "unittest",
     ]
+    if icon:
+        cmd += ["--icon", icon]
     if not onedir:
         cmd.append("--onefile")
     if clean:
@@ -131,6 +156,7 @@ def build_pyinstaller(onedir: bool, clean: bool) -> int:
 def build_nuitka(onedir: bool, clean: bool, no_lto: bool = False) -> int:
     if not _check_tool("nuitka", "nuitka", "nuitka"):
         return 1
+    icon = ensure_icon()
     four = windows_version_tuple()
     cmd = [
         sys.executable, "-m", "nuitka",
@@ -148,6 +174,8 @@ def build_nuitka(onedir: bool, clean: bool, no_lto: bool = False) -> int:
         f"--product-version={four}",
         f"--copyright={AUTHOR}",
     ]
+    if icon:
+        cmd.append(f"--windows-icon-from-ico={icon}")
     if no_lto:
         # LTO 是打包里最慢的一环（PySide6 工程可能要几十分钟），
         # 调试/日常打包时关掉能快很多，代价是生成代码略大略慢
@@ -160,6 +188,15 @@ def build_nuitka(onedir: bool, clean: bool, no_lto: bool = False) -> int:
         cmd.append("--remove-output")
     cmd.append(ENTRY)
     return _run(cmd)
+
+
+def verify_icon_in_exe(exe: str) -> None:
+    """打包后立即确认 exe 真的带上了图标（纯读字节，很快）。"""
+    script = os.path.join(ROOT, "scripts", "check_exe_icon.py")
+    if not (exe and os.path.exists(exe) and os.path.exists(script)):
+        return
+    print("\n检查 exe 图标：")
+    subprocess.call([sys.executable, script, exe], cwd=ROOT)
 
 
 def main() -> int:
@@ -183,10 +220,14 @@ def main() -> int:
 
     if args.nuitka:
         code = build_nuitka(args.onedir, args.clean, args.no_lto)
+        exe = os.path.join(BUILD_DIR, "nuitka", "main.dist", f"{NAME}.exe")
     else:
         code = build_pyinstaller(args.onedir, args.clean)
+        exe = (os.path.join(ROOT, "dist", f"{NAME}-{VERSION}", f"{NAME}-{VERSION}.exe")
+               if args.onedir else os.path.join(ROOT, "dist", f"{NAME}-{VERSION}.exe"))
 
     if code == 0:
+        verify_icon_in_exe(exe)
         print("\n打包完成：")
         print(f"  PyInstaller: dist/{NAME}-{VERSION}/{NAME}.exe")
         print(f"  Nuitka:      build/nuitka/main.dist/{NAME}.exe")

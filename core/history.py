@@ -17,6 +17,8 @@ from typing import Dict, Iterable, List, Optional, Sequence
 from PySide6.QtCore import QPointF
 from PySide6.QtGui import QUndoCommand, QUndoStack
 
+from core.text_format import TextFormat
+
 
 def top_level_items(items: Iterable) -> List:
     """过滤掉子项与 None，只保留顶层图形项。"""
@@ -158,6 +160,39 @@ class MoveItemsCommand(QUndoCommand):
 
     def undo(self) -> None:
         self._apply(self._old)
+
+
+# ------------------------------------------------------------------ 原地修改
+
+
+class TextFormatCommand(QUndoCommand):
+    """修改已有文字的文本内容与排版（双击文字编辑时用，可撤销）。
+
+    命令构造时**不**改动画布；新旧状态都在构造时快照下来，
+    ``redo`` 应用新状态、``undo`` 回到旧状态，因此重复撤销/重做是安全的。
+    """
+
+    def __init__(self, item, new_text: str, new_format: TextFormat,
+                 text: str = "编辑文字", parent=None) -> None:
+        super().__init__(text, parent)
+        self._item = item
+        self._old_text = item.toPlainText()
+        self._old_format = TextFormat.from_item(item)
+        self._new_text = new_text
+        self._new_format = new_format.copy()
+
+    def _apply(self, content: str, fmt: TextFormat) -> None:
+        if self._item is None:
+            return
+        self._item.setPlainText(content)
+        self._item.set_text_format(fmt)
+        self._item.update()
+
+    def redo(self) -> None:
+        self._apply(self._new_text, self._new_format)
+
+    def undo(self) -> None:
+        self._apply(self._old_text, self._old_format)
 
 
 # ------------------------------------------------------------------ 工具函数

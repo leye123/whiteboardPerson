@@ -9,6 +9,7 @@
 """
 from __future__ import annotations
 
+import json
 import os
 
 from PySide6.QtCore import QSettings
@@ -21,6 +22,7 @@ from core.paths import (  # noqa: F401  —— 保持 `from core.settings import
     DATA_DIR_ENV,
     ORG_NAME,
 )
+from core.text_format import TextFormat
 
 DEFAULT_TOOL = "pen"
 DEFAULT_COLOR = "#000000"
@@ -28,6 +30,9 @@ DEFAULT_THICKNESS = 2.0
 DEFAULT_ERASER_SIZE = 16.0
 DEFAULT_FONT_SIZE = 16.0
 DEFAULT_THEME = "light"
+DEFAULT_LINE_STYLE = "solid"       # 线型：实线/虚线/点线/点划线
+DEFAULT_SHAPE = "rect"             # 形状工具上次选中的种类
+FONTS_KEY = "fonts/imported"       # 导入字体的文件清单（重置设置时保留）
 
 
 class AppSettings:
@@ -68,13 +73,27 @@ class AppSettings:
         self.migrated_from_registry = True
 
     def reset(self) -> None:
-        """清空全部偏好（颜色、粗细、工具、主题、窗口位置…），恢复出厂默认。"""
+        """清空全部偏好（颜色、粗细、工具、主题、窗口位置…），恢复出厂默认。
+
+        已导入的字体清单会被保留：字体是用户**导入的资源**（文件还在 fonts/
+        目录里），清掉清单只会让它们“消失”，而不是恢复默认外观。
+        """
+        imported_fonts = self._s.value(FONTS_KEY)
         self._s.clear()
+        if imported_fonts is not None:
+            self._s.setValue(FONTS_KEY, imported_fonts)
         self._s.sync()
 
     def sync(self) -> None:
         """立即把偏好写入磁盘（QSettings 平时是延迟落盘的）。"""
         self._s.sync()
+
+    # ------------------------------------------------------------- 原始键值
+    def raw_value(self, key: str, default=None):
+        return self._s.value(key, default)
+
+    def set_raw_value(self, key: str, value) -> None:
+        self._s.setValue(key, value)
 
     # ------------------------------------------------------------- 工具与样式
     def current_tool(self) -> str:
@@ -106,6 +125,39 @@ class AppSettings:
 
     def set_font_size(self, value: float) -> None:
         self._s.setValue("style/font_size", float(value))
+
+    # ------------------------------------------------------------- 线型 / 形状
+    def line_style(self) -> str:
+        from canvas.items import LINE_STYLES
+
+        value = str(self._s.value("style/line_style", DEFAULT_LINE_STYLE))
+        return value if value in LINE_STYLES else DEFAULT_LINE_STYLE
+
+    def set_line_style(self, name: str) -> None:
+        self._s.setValue("style/line_style", str(name))
+
+    def shape_kind(self) -> str:
+        from tools.shape_tool import SHAPE_SPECS
+
+        value = str(self._s.value("tools/shape", DEFAULT_SHAPE))
+        return value if value in SHAPE_SPECS else DEFAULT_SHAPE
+
+    def set_shape_kind(self, kind: str) -> None:
+        self._s.setValue("tools/shape", str(kind))
+
+    # ------------------------------------------------------------- 文字排版
+    def text_format(self) -> TextFormat:
+        """上次使用的文字排版（字体、字号、颜色、换行…）。"""
+        raw = self._s.value("text/format", "")
+        if not raw:
+            return TextFormat(color=self.color(), pixel_size=DEFAULT_FONT_SIZE)
+        try:
+            return TextFormat.from_dict(json.loads(str(raw)))
+        except (ValueError, TypeError):
+            return TextFormat(color=self.color(), pixel_size=DEFAULT_FONT_SIZE)
+
+    def set_text_format(self, fmt: TextFormat) -> None:
+        self._s.setValue("text/format", json.dumps(fmt.to_dict(), ensure_ascii=False))
 
     def theme(self) -> str:
         value = str(self._s.value("app/theme", DEFAULT_THEME))

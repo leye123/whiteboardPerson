@@ -48,11 +48,30 @@ def _print_paths() -> int:
     return 0
 
 
+def _set_app_user_model_id() -> None:
+    """在 Windows 上声明本进程的 AppUserModelID。
+
+    Windows 默认按进程路径给任务栏分组：打包/源码运行时的宿主是 python.exe，
+    于是任务栏上可能显示 Python 的图标、并把多个程序混在一起。
+    显式设置 ID 之后，任务栏、Alt+Tab 都会用窗口自己的图标（见 setWindowIcon）。
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            f"{ORG_NAME}.{APP_NAME}")
+    except Exception:  # noqa: BLE001 —— 拿不到就算了，不影响使用
+        pass
+
+
 def main(argv=None) -> int:
     argv = list(sys.argv if argv is None else argv)
     if "--paths" in argv:
         return _print_paths()
 
+    _set_app_user_model_id()
     app = QApplication(argv)
     app.setOrganizationName(ORG_NAME)          # QSettings / QStandardPaths 用
     app.setApplicationName(APP_NAME)

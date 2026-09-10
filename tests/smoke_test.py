@@ -193,7 +193,9 @@ def main() -> int:
     # ---- 6. 选择 + 拖动（带撤销）
     win.set_active_tool("selector")
     scene = win.view.scene()
-    stroke = [it for it in scene.items() if hasattr(it, "path")]
+    # 注意：不能用 hasattr(it, "path") 找笔画 —— 矩形/多边形等形状改成
+    # 路径实现之后也带 path 属性，这里按类型精确筛选。
+    stroke = [it for it in scene.items() if isinstance(it, StrokeItem)]
     ok(len(stroke) == 1, "找到笔画对象")
     target = stroke[0]
     pos_before = target.scenePos()
@@ -420,12 +422,178 @@ def main() -> int:
     bottom = geometry_image.height() - 1 - max(ink_y)
     ok(abs(left - right) <= 3 and abs(top - bottom) <= 3,
        f"导出内容四周留白均匀（左{left} 右{right} 上{top} 下{bottom}）")
-    ok(abs(left - 48) <= 3,
+    # 期望 24 场景像素 × 2 倍超采样 = 48；自定义图形项会在边界外多留
+    # 1 像素抗锯齿余量（见 canvas.items.pen_bounds），所以允许 48~52。
+    ok(48 <= left <= 52,
        f"留白等于设定边距 24 × 2 倍超采样（实测 {left}）")
     ok(abs(max(ink_x) - min(ink_x) + 1 - 404) <= 3
        and abs(max(ink_y) - min(ink_y) + 1 - 204) <= 3,
        f"内容尺寸正确（{max(ink_x) - min(ink_x) + 1}x{max(ink_y) - min(ink_y) + 1}，"
        f"期望 404x204）")
+
+    # ------------------------------------------------------------------
+    # 以下为「形状种类 / 虚线 / 文字排版 / 导入图片」的回归检查
+    # ------------------------------------------------------------------
+    from canvas.items import (
+        EllipseItem,
+        ImageItem,
+        LineItem,
+        PolygonShapeItem,
+        TextItem,
+    )
+    from core.text_format import TextFormat
+    from widgets.text_dialog import TextDialog
+
+    def fresh_scene():
+        """清空当前页并让撤销栈变干净。
+
+        不用 ``new_document()``：它会因为“有未保存改动”弹确认框，
+        而冒烟测试里那个确认框被替换成一律返回 No。
+        """
+        stack = win.undo_stack
+        stack.clear()
+        scene_ = win.view.scene()
+        for item in list(scene_.items()):
+            scene_.removeItem(item)
+        stack.clear()
+        stack.setClean()
+        app.processEvents()
+        return scene_
+
+    # ---- 14. 封闭图形：矩形 / 圆角矩形 / 椭圆 / 三角形 / 菱形 / 五角星
+    scene = fresh_scene()
+    closed_kinds = ("rect", "round_rect", "ellipse", "triangle", "diamond", "star")
+    for index, kind in enumerate(closed_kinds):
+        win.set_active_tool(kind)
+        x = 120 + index * 90
+        drag(vp, QPoint(x, 160), [QPoint(x + 60, 220), QPoint(x + 70, 250)])
+        app.processEvents()
+    ok(page_counts(win)[0] == len(closed_kinds),
+       f"{len(closed_kinds)} 种封闭图形都能绘制（实际 {page_counts(win)[0]}）")
+    shapes = list(scene.items())
+    rounded = [it for it in shapes if isinstance(it, RectItem) and it.radius_value() > 0]
+    ok(len(rounded) == 1, "圆角矩形的圆角半径大于 0")
+    ok(len([it for it in shapes if isinstance(it, EllipseItem)]) == 1, "椭圆绘制成功")
+    ok(len([it for it in shapes if isinstance(it, PolygonShapeItem)]) == 3,
+       "三角形 / 菱形 / 五角星各绘制出一个")
+    kinds = sorted(it.kind() for it in shapes if isinstance(it, PolygonShapeItem))
+    ok(kinds == ["diamond", "star", "triangle"], f"多边形种类正确：{kinds}")
+
+    # 橡皮擦对多边形/文字/图片是整体删除（以前这三类根本擦不掉）
+    win.set_active_tool("eraser")
+    before = page_counts(win)[0]
+    star = [it for it in scene.items()
+            if isinstance(it, PolygonShapeItem) and it.kind() == "star"][0]
+    # 命中判定用的是「描边路径」（未填充图形点中间不算命中），
+    # 所以取路径上的点而不是外接矩形中心。
+    hit = star.path().pointAtPercent(0.05) + star.scenePos()
+    click(vp, win.view.mapFromScene(hit))
+    app.processEvents()
+    ok(page_counts(win)[0] == before - 1, "橡皮擦能把五角星整体擦掉")
+
+    # ---- 15. 线段：直线 / 虚线 / 箭头 / 虚线箭头 / 双向箭头
+    scene = fresh_scene()
+    line_kinds = ("line", "dashed_line", "arrow", "dashed_arrow", "double_arrow")
+    for index, kind in enumerate(line_kinds):
+        win.set_active_tool(kind)
+        y = 150 + index * 70
+        drag(vp, QPoint(180, y), [QPoint(300, y + 30), QPoint(380, y + 40)])
+        app.processEvents()
+    lines = [it for it in scene.items() if isinstance(it, LineItem)]
+    ok(len(lines) == len(line_kinds), f"{len(line_kinds)} 种线段都能绘制")
+    combos = {}
+    for item in lines:
+        data = item.to_dict()
+        combos[(data["arrow"], data["line_style"])] = \
+            combos.get((data["arrow"], data["line_style"]), 0) + 1
+    ok(combos.get(("none", "solid")) == 1 and combos.get(("none", "dash")) == 1,
+       "直线 = 实线，虚线 = 虚线")
+    ok(combos.get(("end", "solid")) == 1 and combos.get(("end", "dash")) == 1,
+       "箭头/虚线箭头都带终点箭头，线型分别为实线/虚线")
+    ok(combos.get(("both", "solid")) == 1, "双向箭头两端都有箭头")
+
+    # 线型下拉框：任意形状都能画成虚线（这里用点线验证）
+    scene = fresh_scene()
+    win.line_style_picker.set_current("dot")
+    app.processEvents()
+    ok(win.tools["rect"].line_style == "dot" and win.settings.line_style() == "dot",
+       "线型下拉框同步到形状工具与设置")
+    win.set_active_tool("round_rect")
+    drag(vp, QPoint(200, 200), [QPoint(320, 280)])
+    app.processEvents()
+    drawn = [it for it in scene.items() if isinstance(it, RectItem)]
+    ok(len(drawn) == 1 and drawn[0].to_dict()["line_style"] == "dot",
+       "圆角矩形按所选线型（点线）绘制")
+    win.line_style_picker.set_current("solid")
+    ok(win.tools["round_rect"].line_style == "solid", "线型可以切回实线")
+
+    # ---- 16. 文字：字体 / 字号 / 颜色 / 粗斜体 / 自动换行 + 双击编辑
+    scene = fresh_scene()
+    sample = TextFormat(family="Consolas", pixel_size=28, color=QColor("#c0392b"),
+                        bold=True, wrap=True, text_width=180, align="center")
+    TextDialog.ask = staticmethod(lambda *a, **k: ("自动换行\n的文字", sample))
+    win.set_active_tool("text")
+    click(vp, QPoint(420, 300))
+    app.processEvents()
+    texts = [it for it in scene.items() if isinstance(it, TextItem)]
+    ok(len(texts) == 1, "文字对象插入")
+    text_item = texts[0]
+    ok(text_item.font().pixelSize() == 28 and text_item.font().bold(),
+       "字号与粗体按对话框参数生效")
+    ok(text_item.font().family() == "Consolas", "字体族按对话框参数生效")
+    ok(text_item.is_wrapped() and abs(text_item.text_width() - 180) < 0.01,
+       "自动换行与折行宽度按参数生效")
+    ok(text_item.defaultTextColor().name() == "#c0392b", "文字颜色按参数生效")
+    ok(text_item.text_align() == "center", "对齐方式按参数生效")
+    clone = TextItem.from_dict(text_item.to_dict())
+    ok(clone.to_dict() == text_item.to_dict(),
+       "文字排版可无损序列化（字体/字号/颜色/换行/对齐）")
+
+    edited = TextFormat(pixel_size=12, color=QColor("#1a4fb4"), wrap=False)
+    TextDialog.ask = staticmethod(lambda *a, **k: ("改过的文字", edited))
+    win.set_active_tool("selector")
+    screen_pos = win.view.mapFromScene(text_item.scenePos() + QPointF(30, 12))
+    double_click(vp, screen_pos)
+    app.processEvents()
+    ok(text_item.toPlainText() == "改过的文字"
+       and text_item.font().pixelSize() == 12
+       and not text_item.is_wrapped(),
+       "双击文字可编辑内容与排版")
+    win.undo_stack.undo()
+    app.processEvents()
+    ok(text_item.toPlainText() == "自动换行\n的文字"
+       and text_item.font().pixelSize() == 28
+       and text_item.is_wrapped(),
+       "文字编辑可撤销（内容与排版一起回退）")
+
+    # ---- 17. 导入图片（回归：mapToScene(QPointF) 曾抛 TypeError，表现为“点了没反应”）
+    scene = fresh_scene()
+    img_path = os.path.join(_tmp, "sample.png")
+    sample_image = QImage(120, 80, QImage.Format.Format_ARGB32)
+    sample_image.fill(QColor("#2f7bd8"))
+    ok(sample_image.save(img_path), "准备好测试图片")
+    QFileDialog.getOpenFileName = staticmethod(lambda *a, **k: (img_path, ""))
+    failure = None
+    try:
+        win.import_image()
+    except Exception as exc:  # noqa: BLE001
+        failure = exc
+    app.processEvents()
+    ok(failure is None, f"导入图片不再抛异常（{failure!r}）")
+    images = [it for it in scene.items() if isinstance(it, ImageItem)]
+    ok(len(images) == 1, "导入的图片进入场景")
+    ok(images[0].pixmap().width() == 120 and images[0].pixmap().height() == 80,
+       "小于视图的图片保持原始尺寸")
+    ok(images[0].isSelected(), "导入后图片被选中（可以马上拖动）")
+
+    warnings_seen = []
+    QMessageBox.warning = staticmethod(lambda *a, **k: warnings_seen.append(a[1:]))
+    bad_path = os.path.join(_tmp, "not_an_image.txt")
+    with open(bad_path, "w", encoding="utf-8") as handle:
+        handle.write("这根本不是图片")
+    QFileDialog.getOpenFileName = staticmethod(lambda *a, **k: (bad_path, ""))
+    win.import_image()
+    ok(len(warnings_seen) == 1, "读到非法图片时给出明确提示（而不是静默失败）")
 
     print(f"\n全部 {checks} 项冒烟检查通过")
     return 0

@@ -35,8 +35,12 @@ SIZE = int(sys.argv[1]) if len(sys.argv) > 1 else 30
 NAMES = sys.argv[2:] or list(icons.ICON_NAMES)
 
 for name in NAMES:
-    pixmap = icons.tool_icon(name, "light").pixmap(QSize(SIZE, SIZE), 1.0)
-    image = pixmap.toImage()
+    if name == "app":
+        # 应用图标（exe / 窗口图标）用的是另一套绘制代码，单独支持
+        image = icons.app_image(SIZE, "light")
+    else:
+        pixmap = icons.tool_icon(name, "light").pixmap(QSize(SIZE, SIZE), 1.0)
+        image = pixmap.toImage()
     print(f"--- {name} ({image.width()}x{image.height()}) ---")
     for y in range(image.height()):
         row = "".join(
@@ -44,3 +48,4 @@ for name in NAMES:
             ("+" if image.pixelColor(x, y).alpha() > 30 else ".")
             for x in range(image.width()))
         print("   " + row)
+

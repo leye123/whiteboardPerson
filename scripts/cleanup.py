@@ -7,7 +7,8 @@
   （新版已不再写入；首次运行新版会把里面的值迁移到 ini，注册表项本身保留）
 * **旧版应用数据目录**：``%APPDATA%\\WhiteboardPyside\\...``
   （旧版把自动备份放在那里，其中有 ``autosave.wbd``）
-* 当前配置文件 / 当前自动备份文件（在软件目录或 WHITEBOARD_DATA_DIR 下）
+* **当前配置文件 / 当前自动备份文件**（在软件目录或 WHITEBOARD_DATA_DIR 下）
+* **导入的字体**：``fonts/``（用户通过「导入字体…」复制进来的 .ttf/.otf）
 
 用法：
     python scripts/cleanup.py                 # 列出并询问后清理
@@ -111,6 +112,33 @@ def legacy_app_data_dirs() -> list:
             and os.path.basename(os.path.normpath(p)) in (paths.APP_NAME, LEGACY_DIR_NAME)]
 
 
+def imported_font_dir() -> str:
+    """用户导入的字体存放目录（软件目录/数据目录下的 fonts/）。"""
+    from core import fonts
+
+    return fonts.fonts_directory(create=False)
+
+
+def remove_imported_fonts(dry_run: bool = False) -> str:
+    """删除导入的字体目录。
+
+    字体文件是用户自己导入的资源，只有在做「完整清理」时才处理；
+    双重保护：只允许删除目录名恰好是 ``fonts`` 的那一层。
+    """
+    from core import fonts
+
+    directory = imported_font_dir()
+    if not os.path.isdir(directory):
+        return f"没有导入的字体目录：{directory}"
+    if os.path.basename(os.path.normpath(directory)) != fonts.FONT_DIR_NAME:
+        return f"跳过（目录名不是 {fonts.FONT_DIR_NAME}）：{directory}"
+    count = len(os.listdir(directory))
+    if dry_run:
+        return f"将删除导入的字体目录（{count} 个文件）：{directory}"
+    shutil.rmtree(directory, ignore_errors=True)
+    return f"已删除导入的字体目录（{count} 个文件）：{directory}"
+
+
 def remove_app_data(dry_run: bool = False, autosave: str = None) -> list:
     results = []
     autosave = autosave or fh.autosave_path()
@@ -167,6 +195,7 @@ def main() -> int:
         print(f"  · 配置文件：{settings_location()}")
     if not (args.settings_only or args.legacy_only):
         print(f"  · 自动备份：{fh.autosave_path()}")
+        print(f"  · 导入的字体：{imported_font_dir()}")
     legacy_keys = legacy_registry_keys()
     if legacy_keys:
         # 注意：f-string 的表达式里不能出现反斜杠（Python 3.10），先算好
@@ -192,6 +221,7 @@ def main() -> int:
         print(remove_legacy_registry(dry_run=args.dry_run))
         for line in remove_app_data(dry_run=args.dry_run):
             print(line)
+        print(remove_imported_fonts(dry_run=args.dry_run))
 
     if not args.dry_run:
         print("\n完成。软件目录（含 .venv、wheels、.test_tmp）直接删除即可。")

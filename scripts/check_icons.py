@@ -192,10 +192,34 @@ def check_toolbar(size: int = 24) -> list:
     buttons = [b for b in toolbar.findChildren(QToolButton)
                if b.defaultAction() is not None
                and b.defaultAction() in win.tool_actions.values()]
-    if len(buttons) != len(win.tool_actions):
-        problems.append(f"工具栏按钮数量异常：{len(buttons)} != {len(win.tool_actions)}")
+    import main_window as mw
+
+    expected = list(mw.TOOLBAR_BASE_ORDER) + ["text"]
+    found = [str(b.defaultAction().data()) for b in buttons]
+    if found != expected:
+        problems.append(f"工具栏按钮异常：{found} != {expected}")
+
+    # 「形状」是一个带菜单的下拉按钮：图标要等于当前形状，
+    # 菜单里每个形状动作都必须有图标（否则下拉项会显示空白）。
+    shape_button = getattr(win, "shape_button", None)
+    if shape_button is None:
+        problems.append("找不到「形状」下拉按钮")
+    else:
+        menu = shape_button.menu()
+        count = len(menu.actions()) if menu is not None else 0
+        print(f"  形状下拉按钮：菜单项 {count}，图标为空="
+              f"{shape_button.icon().isNull()}")
+        if shape_button.icon().isNull():
+            problems.append("形状下拉按钮没有图标")
+        if count != len(win.shape_actions):
+            problems.append(f"形状菜单项数量异常：{count} != {len(win.shape_actions)}")
+        for kind, action in win.shape_actions.items():
+            if action.icon().isNull():
+                problems.append(f"形状 {kind} 没有图标")
+        buttons = buttons + [shape_button]
     for button in buttons:
-        key = str(button.defaultAction().data())
+        action = button.defaultAction()
+        key = str(action.data()) if action is not None else "shape"
         # 暂时去掉按钮自身的 QSS（背景/边框），这样抓到的就是纯图标，
         # 否则选中态按钮的强调色边框会被误判成“图标贴边”。
         original_style = button.styleSheet()

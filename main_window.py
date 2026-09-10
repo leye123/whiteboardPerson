@@ -10,6 +10,7 @@ from PySide6.QtGui import (
     QColor,
     QIcon,
     QImage,
+    QImageReader,
     QKeySequence,
     QPainter,
     QPixmap,
@@ -21,54 +22,60 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QToolBar,
+    QToolButton,
 )
 from shiboken6 import isValid
 
 from canvas.view import WhiteboardView
-from core import paths
+from canvas.items import LINE_STYLE_LABELS, ImageItem
+from core import fonts, paths
 from core.version import APP_TITLE, __version__
 from core.history import (
+    AddItemCommand,
     ClearPageCommand,
     RemoveItemsCommand,
 )
 from core.page import BoardPage
 from core.settings import AppSettings
+from core.text_format import TextFormat
 from persistence import file_handler as fh
 from tools.eraser_tool import EraserTool
 from tools.pan_tool import PanTool
 from tools.pen_tool import PenTool
 from tools.selector_tool import SelectorTool
-from tools.shape_tool import ShapeTool
+from tools.shape_tool import SHAPE_SPECS, ShapeTool, is_line_kind, shape_label
 from tools.text_tool import TextTool
 from widgets import icons
 from widgets.color_picker import ColorPickerButton
+from widgets.line_style_picker import LineStylePicker
 from widgets.page_navigator import PageNavigator
 from widgets.thickness_slider import ThicknessSlider
 
+# 非形状工具（选择/拖动/画笔/橡皮/文字）
 TOOL_META = [
     ("selector", "选择", SelectorTool),
     ("pan", "拖动", PanTool),
     ("pen", "画笔", PenTool),
     ("eraser", "橡皮", EraserTool),
-    ("rect", "矩形", lambda: ShapeTool("rect")),
-    ("ellipse", "椭圆", lambda: ShapeTool("ellipse")),
-    ("line", "直线", lambda: ShapeTool("line")),
-    ("arrow", "箭头", lambda: ShapeTool("arrow")),
     ("text", "文字", TextTool),
 ]
 
-# 工具栏上按这个顺序摆放
-TOOLBAR_ORDER = ("selector", "pan", "pen", "eraser", "rect", "ellipse",
-                 "line", "arrow", "text")
+# 形状工具：种类名直接作为工具键（"rect"/"round_rect"/"triangle"/"dashed_arrow"…），
+# 所以设置里保存的 tools/current 就能记住用户上次用的是哪个形状。
+SHAPE_TOOL_KEYS = tuple(SHAPE_SPECS.keys())
+
+# 工具栏上按这个顺序摆放（形状按钮是一个带菜单的下拉按钮）
+TOOLBAR_BASE_ORDER = ("selector", "pan", "pen", "eraser")
 
 RESOURCE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "resources")
 
 
 # 工具栏按钮的悬浮提示（不写就用工具名）
 TOOL_TIPS = {
-    "selector": "选择/移动：点击选中、Ctrl 多选、空白处拖拽框选",
+    "selector": "选择/移动：点击选中、Ctrl 多选、空白处拖拽框选、双击文字可编辑",
     "pan": "拖动画布：按住左键拖动（也可用空格+左键或中键拖拽）",
     "eraser": "橡皮擦：擦掉经过的笔迹片段；范围随「粗细」变化",
+    "text": "文字：点击画布输入文字；可设字体、字号、颜色、自动换行，也能导入字体",
 }
 
 
@@ -79,6 +86,8 @@ class MainWindow(QMainWindow):
         self.resize(1200, 800)
 
         self.settings = AppSettings()
+        # 重新注册用户之前导入的字体（fonts/ 目录里的 .ttf/.otf）
+        self.imported_font_families = fonts.load_imported_fonts(self.settings)
         self._theme = self.settings.theme()
         self.pages: list[BoardPage] = [BoardPage("页面 1")]
         self.page_index = 0
@@ -95,13 +104,32 @@ class MainWindow(QMainWindow):
         # ---------------------------------------------------------- 工具
         self.tools: dict = {}
         self.tool_actions: dict = {}
+        self.shape_actions: dict = {}
         self.tool_group = QActionGroup(self)
         self.tool_group.setExclusive(True)
+
+        self.text_format = self.settings.text_format()
         for key, label, factory in TOOL_META:
-            tool = factory() if callable(factory) else factory
+            if key == "text":
+                tool = TextTool(text_format=self.text_format, settings=self.settings)
+                tool.format_changed = self._on_text_format_changed
+            else:
+                tool = factory() if callable(factory) else factory
             tool.color = self.settings.color()
+            # 需要读写设置的工具（文字对话框要用 settings 记住导入的字体）
+            if hasattr(tool, "settings"):
+                tool.settings = self.settings
             self.tools[key] = tool
             self.tool_group.addAction(self._build_tool_action(key, label))
+
+        # 形状工具：每个种类一个 QAction，集中放在「形状」下拉菜单里
+        for kind in SHAPE_TOOL_KEYS:
+            tool = ShapeTool(kind, self.settings.color(), self.settings.thickness(),
+                             line_style=self.settings.line_style())
+            self.tools[kind] = tool
+            action = self._build_tool_action(kind, shape_label(kind))
+            self.shape_actions[kind] = action
+            self.tool_group.addAction(action)
 
         # 交互样式控件
         self.color_picker = ColorPickerButton(self.settings.color(), self)
@@ -109,6 +137,9 @@ class MainWindow(QMainWindow):
         self.thickness_slider = ThicknessSlider(self)
         self.thickness_slider.set_value(self.settings.thickness())
         self.thickness_slider.thicknessChanged.connect(self._on_thickness_changed)
+        self.line_style_picker = LineStylePicker(self.settings.line_style(), self)
+        self.line_style_picker.set_theme(self._theme)
+        self.line_style_picker.lineStyleChanged.connect(self._on_line_style_changed)
 
         self._create_actions()
         self._create_menus()
@@ -156,8 +187,13 @@ class MainWindow(QMainWindow):
         action = QAction(label, self)
         action.setCheckable(True)
         action.setData(key)
-        action.setToolTip(TOOL_TIPS.get(key, label))
-        action.setStatusTip(TOOL_TIPS.get(key, label))
+        tip = TOOL_TIPS.get(key)
+        if tip is None and key in SHAPE_SPECS:
+            category = "线段" if is_line_kind(key) else "形状"
+            tip = f"{category}：{label}（按住左键拖拽绘制；线型由工具栏的「线型」决定）"
+        tip = tip or label
+        action.setToolTip(tip)
+        action.setStatusTip(tip)
         action.setIcon(icons.tool_icon(key, self._theme))
         self.tool_actions[key] = action
         return action
@@ -175,6 +211,10 @@ class MainWindow(QMainWindow):
                 if isinstance(name, str) and name:
                     action.setIcon(icons.tool_icon(name, self._theme))
         self.setWindowIcon(icons.app_icon(self._theme))
+        if getattr(self, "line_style_picker", None) is not None:
+            self.line_style_picker.set_theme(self._theme)
+        if getattr(self, "shape_button", None) is not None:
+            self._sync_shape_button()
 
     def _create_actions(self) -> None:
         f = self._file_menu_actions = {}
@@ -284,16 +324,33 @@ class MainWindow(QMainWindow):
         bar.setObjectName("tools_bar")
         bar.setMovable(False)
         self.addToolBar(bar)
-        for key in TOOLBAR_ORDER:
+        for key in TOOLBAR_BASE_ORDER:
             bar.addAction(self.tool_actions[key])
         bar.addSeparator()
+
+        # 「形状」下拉按钮：图标显示当前形状，点开是全部形状
+        # （矩形/圆角矩形/椭圆/三角形/菱形/五角星/直线/虚线/箭头/虚线箭头/双向箭头）
+        self.shape_button = QToolButton(bar)
+        self.shape_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.shape_button.setToolTip("形状：点开选择要画的图形")
+        shape_menu = QMenu(self.shape_button)
+        shape_menu.setToolTipsVisible(True)
+        for kind in SHAPE_TOOL_KEYS:
+            shape_menu.addAction(self.shape_actions[kind])
+        self.shape_button.setMenu(shape_menu)
+        bar.addWidget(self.shape_button)
+        bar.addAction(self.tool_actions["text"])
+        bar.addSeparator()
+
         bar.addWidget(self.color_picker)
         bar.addWidget(self.thickness_slider)
+        bar.addWidget(self.line_style_picker)
 
         self.tool_group.triggered.connect(self._on_tool_triggered)
 
         # 选中分组后由 _on_tool_triggered 负责 setChecked，防止单选失效
         self.tool_group.setExclusive(True)
+        self._sync_shape_button()
 
     def _create_statusbar(self) -> None:
         bar = self.statusBar()
@@ -325,8 +382,29 @@ class MainWindow(QMainWindow):
         tool = self.tools[key]
         self.view.set_tool(tool)
         self.settings.set_current_tool(key)
+        if key in SHAPE_SPECS:
+            self.settings.set_shape_kind(key)
+            self.settings.sync()
         self.tool_actions[key].setChecked(True)
-        self.statusBar().showMessage(f"当前工具：{tool.name}", 2000)
+        self._sync_shape_button()
+        if key in SHAPE_SPECS:
+            line = LINE_STYLE_LABELS.get(tool.effective_line_style(), "")
+            self.statusBar().showMessage(
+                f"当前工具：{shape_label(key)}（线型：{line}）", 2000)
+        else:
+            self.statusBar().showMessage(f"当前工具：{tool.name}", 2000)
+
+    def _sync_shape_button(self) -> None:
+        """让「形状」按钮的图标/提示反映当前选中的形状。"""
+        button = getattr(self, "shape_button", None)
+        if button is None:
+            return
+        current = self.settings.current_tool()
+        if current not in SHAPE_SPECS:
+            current = self.settings.shape_kind()
+        action = self.shape_actions.get(current) or self.shape_actions["rect"]
+        button.setIcon(action.icon())
+        button.setToolTip(f"形状：{shape_label(str(action.data()))}（点开选择其它图形）")
 
     # --------------------------------------------------------- 样式联动
     def _apply_style_state(self) -> None:
@@ -334,21 +412,49 @@ class MainWindow(QMainWindow):
         thickness = self.thickness_slider.value()
         self._on_color_changed(color)
         self._on_thickness_changed(thickness)
+        self._on_line_style_changed(self.line_style_picker.current_style())
 
     def _on_color_changed(self, color: QColor) -> None:
         self.settings.set_color(color)
-        for key in ("pen", "rect", "ellipse", "line", "arrow", "text"):
-            self.tools[key].color = QColor(color)
+        for key, tool in self.tools.items():
+            if hasattr(tool, "color"):
+                tool.color = QColor(color)
+        # 文字工具的颜色存在排版参数里，设置里也同步一份
+        self.text_format = self.text_format.copy(color=QColor(color))
+        self.settings.set_text_format(self.text_format)
 
     def _on_thickness_changed(self, value: float) -> None:
         self.settings.set_thickness(value)
-        for key in ("pen", "rect", "ellipse", "line", "arrow"):
+        for key in ("pen",) + SHAPE_TOOL_KEYS:
             self.tools[key].thickness = float(value)
-        # 文字字号、橡皮直径跟随粗细，但映射要温和：
+        # 橡皮直径跟随粗细，但映射要温和：
         # 以前用 value*4+8，粗细调到 40 时橡皮直径会变成 64 像素，
         # 点一下就能把整条笔迹“吃掉”，看起来就像整块删除。
-        self.tools["text"].pixel_size = max(10.0, min(96.0, value * 6))
         self.tools["eraser"].size = max(8.0, min(48.0, value * 2 + 8))
+        # 注意：文字字号**不再**跟着粗细走 —— 文字有自己的字号参数
+        # （在文字对话框里设置，并记在设置文件中）。
+
+    def _on_line_style_changed(self, style: str) -> None:
+        """线型变化：作用到所有图形工具，保存到设置。"""
+        self.settings.set_line_style(style)
+        self.settings.sync()
+        for kind in SHAPE_TOOL_KEYS:
+            self.tools[kind].line_style = style
+        current = self.settings.current_tool()
+        if current in SHAPE_SPECS:
+            forced = SHAPE_SPECS[current][2]
+            message = f"线型：{LINE_STYLE_LABELS.get(style, style)}"
+            if forced:
+                message += f"（当前图形「{shape_label(current)}」固定为虚线）"
+            self.statusBar().showMessage(message, 2000)
+
+    def _on_text_format_changed(self, fmt: TextFormat) -> None:
+        """文字对话框里改了颜色时，同步工具栏颜色按钮与设置。"""
+        self.text_format = fmt.copy()
+        self.settings.set_text_format(self.text_format)
+        if self.color_picker.color() != fmt.color:
+            self.color_picker.set_color(QColor(fmt.color), emit=False)
+            self.settings.set_color(fmt.color)
 
     # ========================================================== 历史/撤销
     @property
@@ -528,27 +634,57 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "导出失败", "PNG 写入失败")
 
     def import_image(self) -> None:
+        """把图片文件作为图形项插入到视图中心。
+
+        踩过的坑：``QGraphicsView.mapToScene()`` **没有 QPointF 重载**，
+        传浮点坐标会抛 ``TypeError``（而且异常发生在 Qt 槽函数里，
+        界面上只是「点了没反应」）。这里统一用 ``mapToScene(QPoint)`` /
+        ``mapToScene(QRect)``。
+        """
         path, _ = QFileDialog.getOpenFileName(
             self, "导入图片", fh.default_directory(),
-            "图片 (*.png *.jpg *.jpeg *.bmp *.webp *.gif);;所有文件 (*)")
+            "图片 (*.png *.jpg *.jpeg *.bmp *.webp *.gif *.tif *.tiff *.svg);;"
+            "所有文件 (*)")
         if not path:
             return
-        pixmap = QPixmap(path)
-        if pixmap.isNull():
-            QMessageBox.warning(self, "导入失败", "无法读取该图片文件")
+
+        # 用 QImageReader 而不是 QPixmap(path)：失败时能拿到具体原因，
+        # 并且 setAutoTransform 会按 EXIF 方向把竖拍照片摆正。
+        reader = QImageReader(path)
+        reader.setAutoTransform(True)
+        image = reader.read()
+        if image.isNull():
+            QMessageBox.warning(
+                self, "导入失败",
+                f"无法读取该图片文件：\n{path}\n\n原因：{reader.errorString()}")
             return
-        from canvas.items import ImageItem
-        from core.history import AddItemCommand
+        pixmap = QPixmap.fromImage(image)
+
+        # 太大的图缩到视图的 80%，否则一张照片会盖住整个画布
+        view = self.view
+        viewport = view.mapToScene(view.viewport().rect()).boundingRect()
+        limit_w = max(64.0, viewport.width() * 0.8)
+        limit_h = max(64.0, viewport.height() * 0.8)
+        scaled = False
+        if pixmap.width() > limit_w or pixmap.height() > limit_h:
+            pixmap = pixmap.scaled(int(limit_w), int(limit_h),
+                                   Qt.AspectRatioMode.KeepAspectRatio,
+                                   Qt.TransformationMode.SmoothTransformation)
+            scaled = True
 
         item = ImageItem(pixmap)
-        # 放在当前视图中心（QPointF 才能接受浮点尺寸）
-        center = self.view.mapToScene(
-            QPointF(self.view.viewport().width() / 2.0,
-                    self.view.viewport().height() / 2.0))
+        center = view.mapToScene(view.viewport().rect().center())
         bounds = item.boundingRect()
         item.setPos(center - QPointF(bounds.width() / 2.0, bounds.height() / 2.0))
-        self.undo_stack.push(AddItemCommand(self.view.scene(), item, "导入图片"))
-        self.statusBar().showMessage(f"已导入：{os.path.basename(path)}", 3000)
+
+        scene = view.scene()
+        scene.clearSelection()
+        item.setSelected(True)              # 导入后直接选中，方便马上拖动
+        self.undo_stack.push(AddItemCommand(scene, item, "导入图片"))
+        message = f"已导入：{os.path.basename(path)}（{pixmap.width()}×{pixmap.height()}）"
+        if scaled:
+            message += "，已按视图大小缩放"
+        self.statusBar().showMessage(message, 4000)
 
     # ========================================================== 编辑操作
     def delete_selected(self) -> None:
@@ -700,9 +836,11 @@ class MainWindow(QMainWindow):
 
     # ========================================================== 收尾
     def reset_settings(self) -> None:
-        """把颜色/粗细/工具/主题/窗口位置等偏好恢复为默认值。"""
+        """把颜色/粗细/线型/工具/主题/窗口位置等偏好恢复为默认值。"""
         from core.settings import (
             DEFAULT_COLOR,
+            DEFAULT_LINE_STYLE,
+            DEFAULT_SHAPE,
             DEFAULT_THEME,
             DEFAULT_THICKNESS,
             DEFAULT_TOOL,
@@ -710,8 +848,9 @@ class MainWindow(QMainWindow):
 
         ret = QMessageBox.question(
             self, "恢复默认设置",
-            "将清除已保存的偏好（颜色、粗细、当前工具、主题、窗口位置、"
-            "自动保存开关），恢复为出厂默认。\n\n画布内容不受影响。是否继续？")
+            "将清除已保存的偏好（颜色、粗细、线型、形状、当前工具、主题、"
+            "窗口位置、文字排版、自动保存开关），恢复为出厂默认。\n\n"
+            "画布内容与已导入的字体不受影响。是否继续？")
         if ret != QMessageBox.StandardButton.Yes:
             return
 
@@ -720,7 +859,12 @@ class MainWindow(QMainWindow):
         self.theme_action.setChecked(DEFAULT_THEME == "dark")
         self._apply_theme(DEFAULT_THEME)
         self.thickness_slider.set_value(DEFAULT_THICKNESS)
+        self.line_style_picker.set_current(DEFAULT_LINE_STYLE)
+        self.text_format = TextFormat(color=QColor(DEFAULT_COLOR))
+        self.settings.set_shape_kind(DEFAULT_SHAPE)
+        self.tools["text"].format = self.text_format.copy()
         self._apply_style_state()
+        self.settings.set_current_tool(DEFAULT_TOOL)
         self.set_active_tool(DEFAULT_TOOL)
         self.statusBar().showMessage("已恢复默认设置", 3000)
 
@@ -745,10 +889,12 @@ class MainWindow(QMainWindow):
             self, f"关于 {APP_TITLE}",
             f"{APP_TITLE} {__version__}\n"
             "基于 PySide6 / Qt Graphics View 的个人白板\n\n"
-            "画笔 · 橡皮（擦断）· 形状 · 文字 · 选择/框选 · 拖动画布\n"
-            "多页面 · 撤销重做 · .wbd 文件 · PNG 导出 · 自动保存\n\n"
+            "画笔 · 橡皮（擦断）· 11 种形状 · 文字（可导入字体）\n"
+            "选择/框选 · 拖动画布 · 多页面 · 撤销重做\n"
+            ".wbd 文件 · PNG 导出 · 导入图片 · 自动保存\n\n"
             "滚轮缩放 · 空格/中键或「拖动」工具平移\n\n"
-            f"配置文件：{self.settings.location}")
+            f"配置文件：{self.settings.location}\n"
+            f"字体目录：{fonts.fonts_directory(create=False)}")
 
     def _shortcut_help(self) -> None:
         QMessageBox.information(
@@ -759,4 +905,5 @@ class MainWindow(QMainWindow):
             "Ctrl+T 新建页面 · Ctrl+Shift+D 删除当前页\n"
             "PgUp/PgDn 切换页面 · Delete 删除选中\n"
             "+ / - 缩放 · Ctrl+0 适应窗口 · Ctrl+1 实际大小\n"
-            "空格/中键拖拽 = 平移画布")
+            "空格/中键拖拽 = 平移画布\n\n"
+            "选择工具下双击文字 = 编辑内容与字体/字号/换行")

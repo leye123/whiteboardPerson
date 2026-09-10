@@ -2,6 +2,17 @@
 
 每个图形项都实现 to_dict()/重建逻辑，并由 item_from_dict() 统一注册表重建，
 因此 scene / 页面内容可以无损序列化为 JSON（.wbd 文件）。
+
+图形族：
+
+* :class:`StrokeItem` —— 手绘笔迹
+* :class:`RectItem` —— 矩形 / 圆角矩形（``radius`` > 0 即圆角）
+* :class:`EllipseItem` —— 椭圆 / 圆
+* :class:`PolygonShapeItem` —— 三角形 / 菱形 / 五角星（按外接矩形生成路径）
+* :class:`LineItem` —— 直线 / 单箭头 / 双向箭头
+
+所有描边类图形都带 ``line_style``（solid / dash / dot / dash_dot），
+虚线可以直接落在任意形状上，而不只是直线。
 """
 from __future__ import annotations
 
@@ -26,7 +37,6 @@ from PySide6.QtWidgets import (
     QGraphicsItem,
     QGraphicsPathItem,
     QGraphicsPixmapItem,
-    QGraphicsRectItem,
     QGraphicsTextItem,
 )
 
@@ -35,6 +45,49 @@ from core.stroke import build_path, qcolor_from_rgba, qcolor_to_rgba
 # 预览态标记：绘制过程中的临时图形项会带上它，序列化时自动跳过。
 # 注意 QGraphicsItem.setData 的 key 必须是 int（不能是字符串）。
 PREVIEW_KEY = 1000
+
+# ------------------------------------------------------------------ 线型
+# 名字 -> Qt 画笔样式；序列化只存名字，换 Qt 版本也稳。
+LINE_STYLES = {
+    "solid": Qt.PenStyle.SolidLine,
+    "dash": Qt.PenStyle.DashLine,
+    "dot": Qt.PenStyle.DotLine,
+    "dash_dot": Qt.PenStyle.DashDotLine,
+}
+LINE_STYLE_LABELS = {
+    "solid": "实线",
+    "dash": "虚线",
+    "dot": "点线",
+    "dash_dot": "点划线",
+}
+DEFAULT_LINE_STYLE = "solid"
+
+# Qt 画笔样式 -> 名字（反查用，只认标准样式）
+_PEN_STYLE_NAMES = {
+    Qt.PenStyle.SolidLine: "solid",
+    Qt.PenStyle.DashLine: "dash",
+    Qt.PenStyle.DotLine: "dot",
+    Qt.PenStyle.DashDotLine: "dash_dot",
+    Qt.PenStyle.DashDotDotLine: "dash_dot",
+    Qt.PenStyle.CustomDashLine: "dash",
+}
+
+
+def line_style_name(style) -> str:
+    """把 Qt 画笔样式或线型名字统一成线型名字（未知值退回实线）。"""
+    if isinstance(style, str):
+        return style if style in LINE_STYLES else DEFAULT_LINE_STYLE
+    try:
+        return _PEN_STYLE_NAMES.get(Qt.PenStyle(style), DEFAULT_LINE_STYLE)
+    except (TypeError, ValueError):
+        return DEFAULT_LINE_STYLE
+
+
+def pen_style(style) -> Qt.PenStyle:
+    """线型名字或 Qt 枚举 -> Qt.PenStyle。"""
+    if isinstance(style, str):
+        return LINE_STYLES.get(style, Qt.PenStyle.SolidLine)
+    return Qt.PenStyle(style)
 
 
 def mark_preview(item, preview: bool = True) -> None:
@@ -47,10 +100,9 @@ def is_preview(item) -> bool:
 # ------------------------------------------------------------------ 工具函数
 
 
-def make_pen(
-    color: QColor, width: float, style: Qt.PenStyle = Qt.PenStyle.SolidLine
-) -> QPen:
-    pen = QPen(QColor(color), float(width), style)
+def make_pen(color: QColor, width: float, style=DEFAULT_LINE_STYLE) -> QPen:
+    """构造画笔；``style`` 可以是线型名字（"dash"）或 Qt.PenStyle。"""
+    pen = QPen(QColor(color), float(width), pen_style(style))
     pen.setCapStyle(Qt.PenCapStyle.RoundCap)
     pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
     return pen
@@ -63,6 +115,21 @@ def stroked_shape(path: QPainterPath, width: float, margin: float = 2.0) -> QPai
     stroker.setCapStyle(Qt.PenCapStyle.RoundCap)
     stroker.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
     return stroker.createStroke(path)
+
+
+def pen_bounds(path: QPainterPath, width: float, slack: float = 1.0) -> QRectF:
+    """按线宽给出**紧凑**的外接矩形（路径 + 半个线宽 + 1 像素余量）。
+
+    为什么要自己算：Qt 6.11 里 ``QGraphicsPathItem`` / ``QGraphicsEllipseItem``
+    的 ``boundingRect()`` 会在路径外再留约 ``1.5 × 线宽``（比真实墨迹宽），
+    于是 ``scene.itemsBoundingRect()`` 偏大，导出 PNG 时四周留白会比设定的
+    边距多出几像素（实测 24px 边距变成 26px）。
+
+    画笔统一用 RoundJoin/RoundCap（见 :func:`make_pen`），不会出现斜接尖角
+    戳出这个范围，所以「半个线宽 + 1px」足够安全。
+    """
+    margin = max(0.0, float(width)) / 2.0 + max(0.0, float(slack))
+    return path.boundingRect().adjusted(-margin, -margin, margin, margin)
 
 
 def rgba_list(color: QColor) -> list:
@@ -141,97 +208,258 @@ class StrokeItem(QGraphicsPathItem):
         return item
 
 
-# ------------------------------------------------------------------ 矩形 / 椭圆
+# ------------------------------------------------------------------ 描边形状公共部分
 
 
-class _RectLikeMixin:
-    """QGraphicsRectItem / QGraphicsEllipseItem 共享的序列化逻辑。"""
-
-    def _common_dict(self, kind: str) -> dict:
-        r = self.rect()
-        return {
-            "type": kind,
-            "x": round(r.x(), 3),
-            "y": round(r.y(), 3),
-            "w": round(r.width(), 3),
-            "h": round(r.height(), 3),
-            "pos": [self.pos().x(), self.pos().y()],
-            "outline": rgba_list(self.pen().color()),
-            "outline_width": round(self.pen().widthF(), 3),
-            "fill": rgba_list(self.brush().color()) if self.brush().style() != Qt.BrushStyle.NoBrush else None,
-        }
-
-    @classmethod
-    def _common_from_dict(cls, data: dict, kind: str):
-        rect = QRectF(data["x"], data["y"], data["w"], data["h"])
-        item = cls(rect)
-        item.setPen(make_pen(qcolor_from_rgba(data.get("outline", [0, 0, 0, 255])),
-                             float(data.get("outline_width", 2.0))))
-        fill = data.get("fill")
-        if fill:
-            item.setBrush(QColor(*fill[:4]))
-        else:
-            item.setBrush(QBrush(Qt.BrushStyle.NoBrush))
-        item.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
-        pos = data.get("pos")
-        if pos:
-            item.setPos(QPointF(pos[0], pos[1]))
-        return item
+def _common_geometry_dict(item, kind: str) -> dict:
+    """描边形状（矩形/椭圆/多边形）共有的序列化字段。"""
+    r = item.rect()
+    data = {
+        "type": item.TYPE,
+        "kind": kind,
+        "x": round(r.x(), 3),
+        "y": round(r.y(), 3),
+        "w": round(r.width(), 3),
+        "h": round(r.height(), 3),
+        "pos": [item.pos().x(), item.pos().y()],
+        "outline": rgba_list(item.pen().color()),
+        "outline_width": round(item.pen().widthF(), 3),
+        "line_style": line_style_name(item.pen().style()),
+        "fill": rgba_list(item.brush().color())
+        if item.brush().style() != Qt.BrushStyle.NoBrush else None,
+    }
+    radius = getattr(item, "radius_value", None)
+    if callable(radius):        # 兼容写成方法的情况
+        radius = radius()
+    if radius is not None:
+        data["radius"] = round(float(radius), 3)
+    return data
 
 
-class RectItem(_RectLikeMixin, QGraphicsRectItem):
+def _apply_common_geometry(item, data: dict):
+    """把序列化数据里的描边/填充/位置应用到已建好的图形项上。"""
+    item.setPen(make_pen(qcolor_from_rgba(data.get("outline", [0, 0, 0, 255])),
+                         float(data.get("outline_width", 2.0)),
+                         data.get("line_style", DEFAULT_LINE_STYLE)))
+    fill = data.get("fill")
+    if fill:
+        item.setBrush(QColor(*fill[:4]))
+    else:
+        item.setBrush(QBrush(Qt.BrushStyle.NoBrush))
+    item.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
+    pos = data.get("pos")
+    if pos:
+        item.setPos(QPointF(pos[0], pos[1]))
+    return item
+
+
+def _data_rect(data: dict) -> QRectF:
+    return QRectF(float(data.get("x", 0.0)), float(data.get("y", 0.0)),
+                  float(data.get("w", 0.0)), float(data.get("h", 0.0)))
+
+
+def rounded_rect_path(rect: QRectF, radius: float) -> QPainterPath:
+    path = QPainterPath()
+    limit = min(rect.width(), rect.height()) / 2.0
+    r = max(0.0, min(float(radius), limit))
+    if r <= 0.01:
+        path.addRect(rect)
+    else:
+        path.addRoundedRect(rect, r, r)
+    return path
+
+
+def default_radius(rect: QRectF) -> float:
+    """圆角矩形的默认圆角半径：随尺寸缩放，小图形不会变成胶囊。"""
+    return max(4.0, min(rect.width(), rect.height()) * 0.18)
+
+
+class RectItem(QGraphicsPathItem):
+    """矩形；``radius`` > 0 时就是圆角矩形。
+
+    用路径实现（而不是 QGraphicsRectItem）是因为 QGraphicsRectItem 画不出圆角。
+    ``TYPE`` 仍保持 "rect"，旧文件里的直角矩形照样能读进来。
+    """
+
     TYPE = "rect"
 
-    def __init__(self, rect: QRectF, outline: QColor = None, width: float = 2.0):
-        super().__init__(rect)
+    def __init__(self, rect: QRectF, outline: QColor = None, width: float = 2.0,
+                 radius: float = 0.0, line_style=DEFAULT_LINE_STYLE):
+        rect = QRectF(rect)
+        super().__init__(rounded_rect_path(rect, radius))
+        self._rect = rect
+        self._radius = max(0.0, float(radius))
         if outline is None:
             outline = QColor(Qt.GlobalColor.black)
-        self.setPen(make_pen(outline, width))
+        self.setPen(make_pen(outline, width, line_style))
         self.setBrush(QBrush(Qt.BrushStyle.NoBrush))
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
 
-    def shape(self) -> QPainterPath:
-        path = QPainterPath()
-        path.addRect(self.rect())
-        return stroked_shape(path, self.pen().widthF())
+    # -- 几何 --
+    def rect(self) -> QRectF:
+        return QRectF(self._rect)
 
+    def radius_value(self) -> float:
+        return self._radius
+
+    def set_rect(self, rect: QRectF) -> None:
+        self.prepareGeometryChange()
+        self._rect = QRectF(rect)
+        self.setPath(rounded_rect_path(self._rect, self._radius))
+        self.update()
+
+    # QGraphicsItem 体系里习惯叫 setRect，这里保持同名别名
+    setRect = set_rect
+
+    def set_radius(self, radius: float) -> None:
+        self.prepareGeometryChange()
+        self._radius = max(0.0, float(radius))
+        self.setPath(rounded_rect_path(self._rect, self._radius))
+        self.update()
+
+    def shape(self) -> QPainterPath:
+        return stroked_shape(self.path(), self.pen().widthF())
+
+    def boundingRect(self) -> QRectF:
+        return pen_bounds(self.path(), self.pen().widthF())
+
+    # -- 序列化 --
     def to_dict(self) -> dict:
-        return self._common_dict(self.TYPE)
+        return _common_geometry_dict(self, "round_rect" if self._radius > 0 else "rect")
 
     @classmethod
     def from_dict(cls, data: dict) -> "RectItem":
-        return cls._common_from_dict(data, "rect")
+        radius = float(data.get("radius", 0.0))
+        if data.get("kind") == "round_rect" and radius <= 0:
+            radius = default_radius(_data_rect(data))
+        item = cls(_data_rect(data), radius=radius)
+        return _apply_common_geometry(item, data)
 
 
-class EllipseItem(_RectLikeMixin, QGraphicsEllipseItem):
+class EllipseItem(QGraphicsEllipseItem):
     TYPE = "ellipse"
 
-    def __init__(self, rect: QRectF, outline: QColor = None, width: float = 2.0):
-        super().__init__(rect)
+    def __init__(self, rect: QRectF, outline: QColor = None, width: float = 2.0,
+                 line_style=DEFAULT_LINE_STYLE):
+        super().__init__(QRectF(rect))
         if outline is None:
             outline = QColor(Qt.GlobalColor.black)
-        self.setPen(make_pen(outline, width))
+        self.setPen(make_pen(outline, width, line_style))
         self.setBrush(QBrush(Qt.BrushStyle.NoBrush))
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
+
+    def set_rect(self, rect: QRectF) -> None:
+        self.setRect(QRectF(rect))
 
     def shape(self) -> QPainterPath:
         path = QPainterPath()
         path.addEllipse(self.rect())
         return stroked_shape(path, self.pen().widthF())
 
+    def boundingRect(self) -> QRectF:
+        margin = self.pen().widthF() / 2.0 + 1.0
+        return QRectF(self.rect()).adjusted(-margin, -margin, margin, margin)
+
     def to_dict(self) -> dict:
-        return self._common_dict(self.TYPE)
+        return _common_geometry_dict(self, "ellipse")
 
     @classmethod
     def from_dict(cls, data: dict) -> "EllipseItem":
-        return cls._common_from_dict(data, "ellipse")
+        item = cls(_data_rect(data))
+        return _apply_common_geometry(item, data)
+
+
+# 多边形形状：按外接矩形生成路径
+POLYGON_KINDS = ("triangle", "diamond", "star")
+POLYGON_LABELS = {"triangle": "三角形", "diamond": "菱形", "star": "五角星"}
+
+
+def polygon_shape_path(kind: str, rect: QRectF) -> QPainterPath:
+    """按外接矩形生成三角形/菱形/五角星的路径。"""
+    cx, cy = rect.center().x(), rect.center().y()
+    rx, ry = rect.width() / 2.0, rect.height() / 2.0
+    path = QPainterPath()
+    if kind == "triangle":
+        vertices = [(cx, rect.top()), (rect.right(), rect.bottom()),
+                    (rect.left(), rect.bottom())]
+    elif kind == "diamond":
+        vertices = [(cx, rect.top()), (rect.right(), cy),
+                    (cx, rect.bottom()), (rect.left(), cy)]
+    elif kind == "star":
+        vertices = []
+        for i in range(10):
+            factor = 1.0 if i % 2 == 0 else 0.42
+            angle = -math.pi / 2 + i * math.pi / 5
+            vertices.append((cx + rx * factor * math.cos(angle),
+                             cy + ry * factor * math.sin(angle)))
+    else:
+        raise ValueError(f"不支持的多边形类型: {kind}")
+    path.moveTo(*vertices[0])
+    for point in vertices[1:]:
+        path.lineTo(*point)
+    path.closeSubpath()
+    return path
+
+
+class PolygonShapeItem(QGraphicsPathItem):
+    """三角形 / 菱形 / 五角星（统一按外接矩形定义，方便拖拽绘制）。"""
+
+    TYPE = "polygon"
+
+    def __init__(self, kind: str, rect: QRectF, outline: QColor = None,
+                 width: float = 2.0, line_style=DEFAULT_LINE_STYLE):
+        if kind not in POLYGON_KINDS:
+            raise ValueError(f"不支持的多边形类型: {kind}")
+        rect = QRectF(rect)
+        super().__init__(polygon_shape_path(kind, rect))
+        self._kind = kind
+        self._rect = rect
+        if outline is None:
+            outline = QColor(Qt.GlobalColor.black)
+        self.setPen(make_pen(outline, width, line_style))
+        self.setBrush(QBrush(Qt.BrushStyle.NoBrush))
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
+
+    def rect(self) -> QRectF:
+        return QRectF(self._rect)
+
+    def kind(self) -> str:
+        return self._kind
+
+    def set_rect(self, rect: QRectF) -> None:
+        self.prepareGeometryChange()
+        self._rect = QRectF(rect)
+        self.setPath(polygon_shape_path(self._kind, self._rect))
+        self.update()
+
+    setRect = set_rect
+
+    def shape(self) -> QPainterPath:
+        return stroked_shape(self.path(), self.pen().widthF())
+
+    def boundingRect(self) -> QRectF:
+        return pen_bounds(self.path(), self.pen().widthF())
+
+    def to_dict(self) -> dict:
+        return _common_geometry_dict(self, self._kind)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "PolygonShapeItem":
+        kind = data.get("kind", "triangle")
+        if kind not in POLYGON_KINDS:
+            kind = "triangle"
+        item = cls(kind, _data_rect(data))
+        return _apply_common_geometry(item, data)
 
 
 # ------------------------------------------------------------------ 直线 / 箭头
 
+# 箭头形态：无 / 终点箭头 / 双向箭头
+ARROW_NONE, ARROW_END, ARROW_BOTH = "none", "end", "both"
+
 
 class LineItem(QGraphicsItem):
-    """带可选箭头端点的直线。
+    """带可选箭头的直线（支持实线/虚线等线型与双向箭头）。
 
     几何存储在场景坐标中（item 自身 pos 保持 (0,0)），
     移动通过 setPos 完成，因此序列化记录 pos 即可。
@@ -240,12 +468,12 @@ class LineItem(QGraphicsItem):
     TYPE = "line"
 
     def __init__(self, start: QPointF, end: QPointF, outline: QColor,
-                 width: float, arrow: bool = False):
+                 width: float, arrow=ARROW_NONE, line_style=DEFAULT_LINE_STYLE):
         super().__init__()
         self._p1 = QPointF(start)
         self._p2 = QPointF(end)
-        self._arrow = bool(arrow)
-        self._pen = make_pen(outline, width)
+        self._arrow = _normalize_arrow(arrow)
+        self._pen = make_pen(outline, width, line_style)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
         self.setZValue(0)
 
@@ -256,6 +484,9 @@ class LineItem(QGraphicsItem):
     def end(self) -> QPointF:
         return self._p2
 
+    def arrow(self) -> str:
+        return self._arrow
+
     def set_endpoints(self, start: QPointF, end: QPointF) -> None:
         self.prepareGeometryChange()
         self._p1 = QPointF(start)
@@ -263,28 +494,39 @@ class LineItem(QGraphicsItem):
         self.update()
 
     def set_pen(self, pen: QPen) -> None:
-        """替换画笔（用于预览态的虚线笔）。"""
+        """替换画笔（用于预览态的虚线笔，以及切换线宽/线型/颜色）。"""
         self.prepareGeometryChange()
         self._pen = QPen(pen)
         self.update()
 
-    def _arrow_head(self) -> QPolygonF:
-        """按线宽缩放箭头头大小，返回以 self._p2 为顶点的三角形。"""
+    def _head_at(self, tip_point: QPointF, direction: QPointF) -> QPolygonF:
+        """按线宽缩放箭头头大小，返回以 ``tip_point`` 为顶点、指向 ``direction`` 的三角形。"""
         width = self._pen.widthF()
         size = max(10.0, width * 3.2)
-        dx, dy = self._p2.x() - self._p1.x(), self._p2.y() - self._p1.y()
+        dx, dy = direction.x(), direction.y()
         length = math.hypot(dx, dy)
         if length < 1e-6:
             return QPolygonF()
         ux, uy = dx / length, dy / length          # 单位方向
         px, py = -uy, ux                           # 垂直单位
-        tip = QPointF(self._p2.x() - ux * width * 0.6, self._p2.y() - uy * width * 0.6)
+        tip = QPointF(tip_point.x() - ux * width * 0.6,
+                      tip_point.y() - uy * width * 0.6)
         base = QPointF(tip.x() - ux * size, tip.y() - uy * size)
         return QPolygonF([
             tip,
             QPointF(base.x() + px * size * 0.45, base.y() + py * size * 0.45),
             QPointF(base.x() - px * size * 0.45, base.y() - py * size * 0.45),
         ])
+
+    def arrow_heads(self) -> list:
+        """返回所有箭头三角形（终点 / 起点）。"""
+        heads = []
+        delta = self._p2 - self._p1
+        if self._arrow in (ARROW_END, ARROW_BOTH):
+            heads.append(self._head_at(self._p2, delta))
+        if self._arrow == ARROW_BOTH:
+            heads.append(self._head_at(self._p1, -delta))
+        return [h for h in heads if not h.isEmpty()]
 
     # -- QGraphicsItem 接口 --
     def boundingRect(self) -> QRectF:
@@ -298,8 +540,7 @@ class LineItem(QGraphicsItem):
         path = QPainterPath()
         path.moveTo(self._p1)
         path.lineTo(self._p2)
-        head = self._arrow_head()
-        if not head.isEmpty():
+        for head in self.arrow_heads():
             path.addPolygon(head)
         return stroked_shape(path, self._pen.widthF())
 
@@ -307,11 +548,11 @@ class LineItem(QGraphicsItem):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         painter.setPen(self._pen)
         painter.drawLine(self._p1, self._p2)
-        if self._arrow:
-            head = self._arrow_head()
-            if not head.isEmpty():
-                painter.setPen(Qt.PenStyle.NoPen)
-                painter.setBrush(self._pen.color())
+        heads = self.arrow_heads()
+        if heads:
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(self._pen.color())
+            for head in heads:
                 painter.drawPolygon(head)
 
     # -- 序列化 --
@@ -323,6 +564,7 @@ class LineItem(QGraphicsItem):
             "pos": [self.pos().x(), self.pos().y()],
             "outline": rgba_list(self._pen.color()),
             "outline_width": round(self._pen.widthF(), 3),
+            "line_style": line_style_name(self._pen.style()),
             "arrow": self._arrow,
         }
 
@@ -333,7 +575,8 @@ class LineItem(QGraphicsItem):
             QPointF(data.get("x2", 0.0), data.get("y2", 0.0)),
             qcolor_from_rgba(data.get("outline", [0, 0, 0, 255])),
             float(data.get("outline_width", 2.0)),
-            bool(data.get("arrow", False)),
+            data.get("arrow", ARROW_NONE),
+            data.get("line_style", DEFAULT_LINE_STYLE),
         )
         pos = data.get("pos")
         if pos:
@@ -341,20 +584,96 @@ class LineItem(QGraphicsItem):
         return item
 
 
+def _normalize_arrow(value) -> str:
+    """兼容旧文件的布尔箭头标记（True -> 终点箭头）。"""
+    if value is True:
+        return ARROW_END
+    if value in (False, None):
+        return ARROW_NONE
+    return value if value in (ARROW_NONE, ARROW_END, ARROW_BOTH) else ARROW_NONE
+
+
 # ------------------------------------------------------------------ 文字
+
+# 文本对齐：左 / 居中 / 右
+TEXT_ALIGNS = ("left", "center", "right")
 
 
 class TextItem(QGraphicsTextItem):
+    """文字块：字体、字号、粗斜体、颜色、对齐、自动换行（固定文本宽度）都可自定义。
+
+    自动换行的实现是 ``setTextWidth(w)``：Qt 会在 ``w`` 宽度内折行，
+    因此换行宽度本身也要序列化，重新打开才能保持同样的排版。
+    """
+
     TYPE = "text"
 
-    def __init__(self, text: str, color: QColor, pixel_size: float = 16.0):
+    def __init__(self, text: str, color: QColor, pixel_size: float = 16.0,
+                 family: str = "", bold: bool = False, italic: bool = False,
+                 wrap: bool = False, text_width: float = 300.0, align: str = "left",
+                 font_file: str = ""):
         super().__init__(text)
+        self._font_file = font_file or ""
         self.setDefaultTextColor(QColor(color))
-        font = QFont()
-        font.setPixelSize(int(max(8, pixel_size)))
+        self._wrap = bool(wrap)
+        self._text_width = float(text_width)
+        font = QFont(family) if family else QFont()
+        font.setPixelSize(int(max(6, pixel_size)))
+        font.setBold(bool(bold))
+        font.setItalic(bool(italic))
         self.setFont(font)
+        self.set_text_align(align)
+        self._apply_wrap()
         self.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
+
+    # -- 排版 --
+    def _apply_wrap(self) -> None:
+        self.setTextWidth(self._text_width if self._wrap else -1.0)
+
+    def is_wrapped(self) -> bool:
+        return self._wrap
+
+    def text_width(self) -> float:
+        return self._text_width
+
+    def set_wrap(self, wrap: bool, text_width: float = None) -> None:
+        self._wrap = bool(wrap)
+        if text_width is not None:
+            self._text_width = max(20.0, float(text_width))
+        self._apply_wrap()
+
+    def text_align(self) -> str:
+        return getattr(self, "_align", "left")
+
+    def set_text_align(self, align: str) -> None:
+        align = align if align in TEXT_ALIGNS else "left"
+        self._align = align
+        option = self.document().defaultTextOption()
+        option.setAlignment({
+            "left": Qt.AlignmentFlag.AlignLeft,
+            "center": Qt.AlignmentFlag.AlignHCenter,
+            "right": Qt.AlignmentFlag.AlignRight,
+        }[align] | Qt.AlignmentFlag.AlignTop)
+        self.document().setDefaultTextOption(option)
+
+    def set_text_format(self, fmt) -> None:
+        """用 :class:`core.text_format.TextFormat` 更新排版（编辑已有文字时用）。"""
+        font = QFont(fmt.family) if fmt.family else QFont()
+        font.setPixelSize(int(max(6, fmt.pixel_size)))
+        font.setBold(bool(fmt.bold))
+        font.setItalic(bool(fmt.italic))
+        self.setFont(font)
+        self.setDefaultTextColor(QColor(fmt.color))
+        self._font_file = getattr(fmt, "font_file", "") or ""
+        self.set_text_align(fmt.align)
+        self.set_wrap(fmt.wrap, fmt.text_width)
+
+    def font_family(self) -> str:
+        return self.font().family()
+
+    def font_file(self) -> str:
+        return self._font_file
 
     def to_dict(self) -> dict:
         font = self.font()
@@ -365,6 +684,13 @@ class TextItem(QGraphicsTextItem):
             "color": rgba_list(self.defaultTextColor()),
             "font_family": font.family(),
             "pixel_size": font.pixelSize(),
+            "bold": font.bold(),
+            "italic": font.italic(),
+            "wrap": self._wrap,
+            "text_width": round(self._text_width, 3),
+            "align": getattr(self, "_align", "left"),
+            # 导入字体记录来源文件：换台机器打开时能提示字体来自哪里
+            "font_file": self._font_file,
         }
 
     @classmethod
@@ -373,12 +699,14 @@ class TextItem(QGraphicsTextItem):
             data.get("text", ""),
             qcolor_from_rgba(data.get("color", [0, 0, 0, 255])),
             float(data.get("pixel_size", 16.0)),
+            family=data.get("font_family", ""),
+            bold=bool(data.get("bold", False)),
+            italic=bool(data.get("italic", False)),
+            wrap=bool(data.get("wrap", False)),
+            text_width=float(data.get("text_width", 300.0)),
+            align=data.get("align", "left"),
+            font_file=data.get("font_file", ""),
         )
-        family = data.get("font_family")
-        if family:
-            font = item.font()
-            font.setFamily(family)
-            item.setFont(font)
         pos = data.get("pos")
         if pos:
             item.setPos(QPointF(pos[0], pos[1]))
@@ -432,6 +760,7 @@ _TYPE_MAP = {
     StrokeItem.TYPE: StrokeItem,
     RectItem.TYPE: RectItem,
     EllipseItem.TYPE: EllipseItem,
+    PolygonShapeItem.TYPE: PolygonShapeItem,
     LineItem.TYPE: LineItem,
     TextItem.TYPE: TextItem,
     ImageItem.TYPE: ImageItem,
@@ -441,8 +770,11 @@ ITEM_TYPES = tuple(_TYPE_MAP.keys())
 
 
 def item_from_dict(data: dict):
-    """按序列化 dict 重建图形项；未知类型返回 None。"""
+    """按序列化 dict 重建图形项；未知类型或坏数据返回 None。"""
     cls = _TYPE_MAP.get(data.get("type"))
     if cls is None:
         return None
-    return cls.from_dict(data)
+    try:
+        return cls.from_dict(data)
+    except (KeyError, TypeError, ValueError):
+        return None

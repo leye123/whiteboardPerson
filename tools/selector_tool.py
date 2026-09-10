@@ -10,21 +10,23 @@ from PySide6.QtGui import QColor, QPainterPath, QPen
 from PySide6.QtWidgets import QGraphicsRectItem
 
 from canvas.items import TextItem, mark_preview
-from core.history import MoveItemsCommand
+from core.history import MoveItemsCommand, TextFormatCommand
+from core.text_format import TextFormat
 from tools.base_tool import BaseTool
-from tools.text_tool import TextEditDialog
+from widgets.text_dialog import TextDialog
 
 
 class SelectorTool(BaseTool):
     name = "选择"
     cursor = Qt.CursorShape.ArrowCursor
 
-    def __init__(self) -> None:
+    def __init__(self, settings=None) -> None:
         super().__init__()
         self._mode = None             # None | 'drag' | 'rubber'
         self._press_scene = QPointF()
         self._drag_origins = {}       # item -> QPointF(scenePos)
         self._rubber_item = None
+        self.settings = settings      # 文字编辑对话框要用（记住导入的字体/排版）
 
     # ------------------------------------------------------------- 事件
     def mousePressEvent(self, event, view) -> None:
@@ -109,17 +111,37 @@ class SelectorTool(BaseTool):
         super().deactivate(view)
 
     def mouseDoubleClickEvent(self, event, view) -> None:
-        """双击文字对象 -> 编辑其内容。"""
+        """双击文字对象 -> 用文字对话框编辑内容与排版（可撤销）。"""
         scene = view.scene()
         item = scene.topmost_item_at(self.scene_pos(event, view))
         if isinstance(item, TextItem):
-            new_text = TextEditDialog.ask(view.window(), "编辑文字", item.toPlainText())
-            if new_text is not None:
-                item.setPlainText(new_text)
-                item.update()
+            current = TextFormat.from_item(item)
+            result = TextDialog.ask(view.window(), "编辑文字", item.toPlainText(),
+                                    current, self.settings)
+            if result:
+                if isinstance(result, tuple):
+                    new_text, new_format = result
+                else:                       # 兼容只返回字符串的实现
+                    new_text, new_format = result, current
+                stack = self.undo_stack(view)
+                command = TextFormatCommand(item, new_text, new_format)
+                if stack is not None:
+                    stack.push(command)
+                else:
+                    command.redo()
+                self._remember_format(new_format)
             event.accept()
             return
         event.accept()
+
+    def _remember_format(self, fmt: TextFormat) -> None:
+        """编辑文字后把排版记为默认，下次输入文字沿用。"""
+        if self.settings is None:
+            return
+        try:
+            self.settings.set_text_format(fmt)
+        except Exception:  # noqa: BLE001
+            pass
 
     def mouseHoverEvent(self, event, view) -> None:
         view.viewport().setCursor(self.cursor)

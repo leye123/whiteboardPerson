@@ -27,8 +27,15 @@ for _stream in (sys.stdout, sys.stderr):
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QPointF, QRectF  # noqa: E402
-from PySide6.QtGui import QColor, QPainterPath, QPixmap, QUndoStack  # noqa: E402
+from PySide6.QtCore import QPointF, QRectF, Qt  # noqa: E402
+from PySide6.QtGui import (  # noqa: E402
+    QColor,
+    QImage,
+    QPainter,
+    QPainterPath,
+    QPixmap,
+    QUndoStack,
+)
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 # 隔离用户配置与数据文件：不能靠 QSettings.setDefaultFormat/setPath
@@ -627,6 +634,237 @@ def test_board_page_helpers():
     assert len(page.strokes) == 1
     page.clear()
     assert page.is_empty()
+
+
+# ------------------------------------------------------------------ 新增图形与线型
+
+
+def test_line_style_helpers():
+    """线型名字 <-> Qt 画笔样式的互转，以及未知值的安全回退。"""
+    from canvas.items import (LINE_STYLES, LINE_STYLE_LABELS, line_style_name,
+                              pen_style)
+
+    for name, style in LINE_STYLES.items():
+        assert pen_style(name) is style
+        assert line_style_name(style) == name
+        assert name in LINE_STYLE_LABELS and LINE_STYLE_LABELS[name]
+    # 未知名字 -> 实线（不抛异常）
+    assert pen_style("nonsense") is Qt.PenStyle.SolidLine
+    assert line_style_name("nonsense") == "solid"
+
+
+def test_round_rect_and_polygon_shapes():
+    """圆角矩形与三角形/菱形/五角星：几何正确 + 可无损往返。"""
+    from canvas.items import (POLYGON_KINDS, PolygonShapeItem, default_radius)
+
+    rect = QRectF(0.0, 0.0, 120.0, 80.0)
+    square = RectItem(rect, QColor(0, 0, 0), 2.0)
+    rounded = RectItem(rect, QColor(0, 0, 0), 2.0, radius=default_radius(rect))
+    assert square.radius_value() == 0.0
+    assert rounded.radius_value() > 0
+    # 直角矩形的路径就是矩形本身；圆角矩形的路径被“削角”，面积更小
+    assert abs(square.path().boundingRect().width() - 120.0) < 0.01
+    assert square.path().contains(QPointF(1.0, 1.0))
+    assert not rounded.path().contains(QPointF(0.5, 0.5))
+    assert rounded.path().contains(QPointF(60.0, 40.0))
+
+    for kind in POLYGON_KINDS:
+        item = PolygonShapeItem(kind, rect, QColor(10, 20, 30), 3.0,
+                                line_style="dash_dot")
+        assert item.kind() == kind
+        clone = _roundtrip(item)
+        assert clone.kind() == kind
+        assert clone.to_dict()["line_style"] == "dash_dot"
+        assert clone.to_dict()["outline_width"] == 3.0
+        # 路径必须落在外接矩形内（顶点是外接矩形的内切位置）
+        bounds = item.path().boundingRect()
+        assert bounds.left() >= -0.01 and bounds.top() >= -0.01
+        assert bounds.right() <= rect.right() + 0.01
+        assert bounds.bottom() <= rect.bottom() + 0.01
+    # 未知种类要报错（而不是静默画个矩形）
+    try:
+        PolygonShapeItem("hexagon", rect, QColor(0, 0, 0), 1.0)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("未知多边形种类应当抛 ValueError")
+
+
+def test_line_arrow_variants_and_dash_renders():
+    """直线/箭头/双向箭头 + 虚线：序列化正确，且虚线真的画出来是断开的。"""
+    from canvas.items import ARROW_BOTH, ARROW_END, ARROW_NONE, LineItem
+
+    solid = LineItem(QPointF(0, 0), QPointF(100, 0), QColor(0, 0, 0), 2.0)
+    single = LineItem(QPointF(0, 0), QPointF(100, 0), QColor(0, 0, 0), 2.0,
+                      arrow=ARROW_END)
+    dashed = LineItem(QPointF(0, 0), QPointF(100, 0), QColor(0, 0, 0), 2.0,
+                      arrow=ARROW_END, line_style="dash")
+    double = LineItem(QPointF(0, 0), QPointF(100, 0), QColor(0, 0, 0), 2.0,
+                      arrow=ARROW_BOTH)
+    assert solid.arrow() == ARROW_NONE and len(solid.arrow_heads()) == 0
+    assert single.arrow() == ARROW_END and len(single.arrow_heads()) == 1
+    assert double.arrow() == ARROW_BOTH and len(double.arrow_heads()) == 2
+    # 旧文件里的布尔箭头标记要能读
+    legacy = LineItem.from_dict({"type": "line", "x1": 0, "y1": 0, "x2": 10, "y2": 0,
+                                 "outline": [0, 0, 0, 255], "outline_width": 2,
+                                 "arrow": True})
+    assert legacy.arrow() == ARROW_END
+    for item in (solid, single, dashed, double):
+        assert _roundtrip(item).to_dict() == item.to_dict()
+
+    # 真的渲染一遍：虚线的墨迹有明显的“断续”（否则只是“标记为虚线”而已）
+    def ink_profile(item) -> tuple:
+        """返回（墨迹像素数，中心扫描线上的墨迹段数）。"""
+        image = QImage(140, 40, QImage.Format.Format_ARGB32)
+        image.fill(QColor(255, 255, 255))
+        painter = QPainter(image)
+        painter.translate(10, 20)
+        item.paint(painter, None, None)
+        painter.end()
+        count = 0
+        for y in range(image.height()):
+            for x in range(image.width()):
+                if image.pixelColor(x, y).lightness() < 200:
+                    count += 1
+        row = [image.pixelColor(x, 20).lightness() < 200 for x in range(image.width())]
+        runs = sum(1 for index, value in enumerate(row)
+                   if value and (index == 0 or not row[index - 1]))
+        return count, runs
+
+    plain = LineItem(QPointF(0, 0), QPointF(100, 0), QColor(0, 0, 0), 2.0)
+    broken = LineItem(QPointF(0, 0), QPointF(100, 0), QColor(0, 0, 0), 2.0,
+                      line_style="dash")
+    solid_ink, solid_runs = ink_profile(plain)
+    dash_ink, dash_runs = ink_profile(broken)
+    assert solid_ink > 0 and dash_ink > 0
+    assert solid_runs == 1, f"实线应当是一整段（实际 {solid_runs} 段）"
+    assert dash_runs >= 4, f"虚线在中心线上应当断成多段（实际 {dash_runs} 段）"
+    assert dash_ink < solid_ink, "虚线墨迹应当少于实线"
+
+
+def test_pen_bounds_keeps_export_margin_tight():
+    """外接矩形只比路径大「半个线宽 + 1px」，导出留白才等于设定边距。"""
+    from canvas.items import PolygonShapeItem, pen_bounds
+
+    rect = QRectF(0.0, 0.0, 40.0, 40.0)
+    for item in (RectItem(rect, QColor(0, 0, 0), 4.0),
+                 EllipseItem(rect, QColor(0, 0, 0), 4.0),
+                 PolygonShapeItem("star", rect, QColor(0, 0, 0), 4.0)):
+        bounds = item.boundingRect()
+        assert bounds.left() >= -3.01 and bounds.top() >= -3.01, bounds
+        assert bounds.right() <= 43.01 and bounds.bottom() <= 43.01, bounds
+    # 线宽越大，边界越宽（0 线宽时靠 1px 余量兜底）
+    path = QPainterPath()
+    path.addRect(QRectF(0, 0, 10, 10))
+    thin = pen_bounds(path, 0.0)
+    thick = pen_bounds(path, 10.0)
+    assert thin.left() == -1.0 and thick.left() == -6.0
+
+
+def test_text_format_roundtrip_and_item_application():
+    """文字排版参数：往返一致、能套到图形项上、可撤销编辑。"""
+    from core.history import TextFormatCommand
+    from core.text_format import TextFormat
+
+    fmt = TextFormat(family="Consolas", pixel_size=27.5, color=QColor("#123456"),
+                     bold=True, italic=True, wrap=True, text_width=210.0,
+                     align="right", font_file="C:/fonts/demo.ttf")
+    data = fmt.to_dict()
+    assert TextFormat.from_dict(data).to_dict() == data
+    # 坏数据要能安全回退（不抛异常）
+    fallback = TextFormat.from_dict({"pixel_size": "abc", "align": "斜的",
+                                     "color": "不是颜色"})
+    assert fallback.pixel_size == 16.0 and fallback.align == "left"
+    assert TextFormat.from_dict(None).pixel_size == 16.0
+
+    item = TextItem("多行\n文字", QColor(0, 0, 0), 12.0)
+    item.set_text_format(fmt)
+    assert item.font().family() == "Consolas"
+    assert item.font().pixelSize() == 27
+    assert item.font().bold() and item.font().italic()
+    assert item.is_wrapped() and item.text_width() == 210.0
+    assert item.text_align() == "right"
+    assert TextFormat.from_item(item).to_dict() == fmt.copy(pixel_size=27).to_dict()
+
+    # 无损往返：字体/字号/颜色/换行/对齐都要回到文档里
+    clone = TextItem.from_dict(item.to_dict())
+    assert clone.to_dict() == item.to_dict()
+    assert clone.is_wrapped()
+
+    # 编辑命令：redo 应用新排版、undo 回到旧排版
+    scene = WhiteboardScene()
+    stack = QUndoStack()
+    scene.addItem(item)
+    stack.push(TextFormatCommand(item, "改过了",
+                                 TextFormat(pixel_size=9, wrap=False)))
+    assert item.toPlainText() == "改过了" and item.font().pixelSize() == 9
+    assert not item.is_wrapped()
+    stack.undo()
+    assert item.toPlainText() == "多行\n文字" and item.font().pixelSize() == 27
+    assert item.is_wrapped()
+    stack.redo()
+    assert item.toPlainText() == "改过了"
+
+
+def test_imported_fonts_are_copied_and_remembered():
+    """导入字体：复制到数据目录的 fonts/、记进设置、文件没了会自动摘掉。"""
+    import shutil
+
+    from core import fonts, paths
+    from core.settings import AppSettings
+
+    source = None
+    for candidate in ("C:/Windows/Fonts/consola.ttf", "C:/Windows/Fonts/arial.ttf",
+                      "C:/Windows/Fonts/segoeui.ttf"):
+        if os.path.exists(candidate):
+            source = candidate
+            break
+    if source is None:
+        print("      （跳过：本机找不到可用的 .ttf 字体文件）")
+        return
+
+    settings = AppSettings()
+    settings.reset()
+    font_dir = fonts.fonts_directory()
+    assert os.path.normcase(os.path.dirname(os.path.abspath(font_dir))) == \
+        os.path.normcase(os.path.abspath(os.environ["WHITEBOARD_DATA_DIR"]))
+    assert fonts.is_supported(source) and not fonts.is_supported("x.png")
+
+    family, stored, families = fonts.import_font(source, settings)
+    assert os.path.exists(stored), "字体文件应当被复制到 fonts/ 目录"
+    assert os.path.normcase(os.path.dirname(stored)) == os.path.normcase(font_dir)
+    assert stored in fonts.stored_paths(settings), "导入的字体要记在设置里"
+
+    # 再次启动：清单里的字体会重新注册（字体库可用时能拿到族名）
+    loaded = fonts.load_imported_fonts(settings)
+    assert isinstance(loaded, list)
+
+    # 文件被删掉后，清单里的死路径要被自动清理（否则每次启动都白试一遍）
+    os.remove(stored)
+    assert fonts.load_imported_fonts(settings) == []
+    assert fonts.stored_paths(settings) == [], "文件已删除的字体要从清单里摘掉"
+    settings.reset()
+
+
+def test_icon_file_has_all_sizes():
+    """.ico 必须包含全部尺寸，否则 exe/任务栏会用错图标或糊掉。"""
+    import struct
+
+    from scripts.make_icon import DEFAULT_PATH, SIZES, build_ico, read_ico_sizes
+
+    path = os.path.join(_TEST_TMP, "test_icon.ico")
+    build_ico(path, sizes=(16, 32, 48))
+    assert read_ico_sizes(path) == [(16, 16), (32, 32), (48, 48)]
+    with open(path, "rb") as handle:
+        head = handle.read(6)
+    assert struct.unpack("<HHH", head) == (0, 1, 3), "ICO 文件头应是 icon 类型 + 3 张图"
+    os.remove(path)
+
+    script_path = DEFAULT_PATH
+    if os.path.exists(script_path):
+        sizes = read_ico_sizes(script_path)
+        missing = [size for size in SIZES if (size, size) not in sizes]
+        assert not missing, f"resources 里的 .ico 缺少尺寸 {missing}"
 
 
 # ------------------------------------------------------------------ 运行器
