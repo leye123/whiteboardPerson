@@ -59,8 +59,8 @@
 ### 方式二：从源码运行（开发者）
 
 ```powershell
-git clone https://github.com/<你的用户名>/whiteboard.git
-cd whiteboard
+git clone https://github.com/<你的用户名>/whiteboardPerson.git
+cd whiteboardPerson
 
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1          # CMD 用 .venv\Scripts\activate.bat
