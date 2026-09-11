@@ -305,6 +305,33 @@ def _text(p: QPainter) -> None:
     _line(p, 7.4, 15.0, 12.6, 15.0)
 
 
+def _group(p: QPainter) -> None:
+    """组合：一个虚线框（容器）+ 里面两个小方块。
+
+    笔画特意调细到 1.4 并缩小整体尺寸：16px 下三组线条很容易糊成一团
+    （墨迹覆盖率超过 55% 就会被自检脚本判定为「看不清」）。
+    """
+    pen = QPen(p.pen())
+    pen.setWidthF(1.4)
+    pen.setDashPattern([1.7, 1.5])
+    p.setPen(pen)
+    _rect(p, 2.8, 2.8, 14.4, 14.4, 1.6)
+    solid = QPen(p.pen())
+    solid.setStyle(Qt.PenStyle.SolidLine)
+    p.setPen(solid)
+    _rect(p, 5.2, 5.2, 5.6, 5.6, 0.8)
+    _rect(p, 9.4, 9.4, 5.2, 5.2, 0.8)
+
+
+def _ungroup(p: QPainter) -> None:
+    """取消组合：两个分开的小方块（没有外框）。"""
+    pen = QPen(p.pen())
+    pen.setWidthF(1.5)
+    p.setPen(pen)
+    _rect(p, 2.6, 2.6, 7.2, 7.2, 0.9)
+    _rect(p, 10.2, 10.2, 7.2, 7.2, 0.9)
+
+
 def _select(p: QPainter) -> None:
     """鼠标指针箭头（闭合轮廓）。"""
     _poly(p, [
@@ -444,6 +471,8 @@ _DRAW: Dict[str, Callable[[QPainter], None]] = {
     "line_style_dash_dot": _line_style_preview("dash_dot"),
     "text": _text,
     "select": _select,
+    "group": _group,
+    "ungroup": _ungroup,
     "undo": _undo,
     "redo": _redo,
     "new": _new,

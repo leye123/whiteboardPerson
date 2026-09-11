@@ -36,6 +36,7 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QGraphicsEllipseItem,
     QGraphicsItem,
+    QGraphicsItemGroup,
     QGraphicsPathItem,
     QGraphicsPixmapItem,
     QGraphicsTextItem,
@@ -242,6 +243,28 @@ class StrokeItem(QGraphicsPathItem):
     def shape(self) -> QPainterPath:  # 加粗命中区
         return stroked_shape(self.path(), self.pen().widthF())
 
+    # ---------------------------------------------------------- 自由伸缩
+    def is_resizable(self) -> bool:
+        return True
+
+    def resize_rect(self) -> QRectF:
+        return self.mapRectToScene(self.boundingRect())
+
+    def resize_state(self) -> dict:
+        return transform_state(self)
+
+    def restore_resize_state(self, state: dict) -> None:
+        apply_transform_state(self, state)
+
+    def resize_with(self, index: int, point: QPointF,
+                    keep_aspect: bool = False) -> None:
+        # 笔迹用 transform 缩放：采样点不动，线宽跟着一起变粗/变细，符合手写的感觉
+        resize_by_transform(self, index, point, keep_aspect)
+
+    def scene_scale(self) -> float:
+        """当前「局部 → 场景」的平均缩放倍数（橡皮擦换算半径用）。"""
+        return item_scene_scale(self)
+
     def to_dict(self) -> dict:
         return {
             "type": self.TYPE,
@@ -319,6 +342,102 @@ def _data_rect(data: dict) -> QRectF:
                   float(data.get("w", 0.0)), float(data.get("h", 0.0)))
 
 
+def local_rect_for(item, target: QRectF) -> QRectF:
+    """把「场景坐标下的目标矩形」换算成图形项的局部矩形。
+
+    ``sceneTransform()`` 已经把父项（例如组合）与自身的变换都算进去了，
+    所以组合被缩放之后，里面的图形项照样能算对。
+    """
+    inverse, invertible = item.sceneTransform().inverted()
+    return inverse.mapRect(QRectF(target)) if invertible else QRectF(target)
+
+
+def item_scene_scale(item) -> float:
+    """图形项当前「局部 → 场景」的平均缩放倍数（橡皮擦换算半径用）。"""
+    determinant = item.sceneTransform().determinant()
+    return abs(determinant) ** 0.5 or 1.0
+
+
+def rect_state(item) -> dict:
+    """缩放快照：局部矩形 + 位置（撤销用）。"""
+    r = item.rect()
+    return {"rect": [round(r.x(), 3), round(r.y(), 3),
+                     round(r.width(), 3), round(r.height(), 3)],
+            "pos": [item.pos().x(), item.pos().y()]}
+
+
+def apply_rect_state(item, state: dict) -> None:
+    rect = state.get("rect")
+    if rect:
+        item.set_rect(QRectF(float(rect[0]), float(rect[1]),
+                             float(rect[2]), float(rect[3])))
+    pos = state.get("pos")
+    if pos:
+        item.setPos(QPointF(float(pos[0]), float(pos[1])))
+
+
+def resize_geometry(item, index: int, point: QPointF, keep_aspect: bool = False,
+                    on_radius=None) -> None:
+    """按手柄拖动结果改图形项的局部矩形（线宽/线型保持不变）。
+
+    形状（矩形/椭圆/多边形）都是「按几何缩放」：改 rect，而不是套 transform ——
+    这样边框线宽不会被拉粗，圆角半径也能按比例跟着变。
+    """
+    from canvas.resize import resized_rect
+
+    scene_rect = item.resize_rect()
+    if scene_rect.width() <= 0 or scene_rect.height() <= 0:
+        return
+    target = resized_rect(scene_rect, index, point, keep_aspect)
+    if on_radius is not None:
+        # 圆角半径按「横纵缩放倍数的几何平均」变：等比缩放时刚好成正比，
+        # 只往一个方向拉时缓慢变大（完全不变会让大图形看起来几乎没有圆角）
+        ratio_x = target.width() / scene_rect.width()
+        ratio_y = target.height() / scene_rect.height()
+        on_radius((ratio_x * ratio_y) ** 0.5)
+    item.set_rect(local_rect_for(item, target))
+
+
+def transform_state(item) -> dict:
+    """缩放快照（transform 版，用于笔迹/图片/组合）。"""
+    transform = item.transform()
+    return {"sx": round(transform.m11(), 6), "sy": round(transform.m22(), 6),
+            "pos": [item.pos().x(), item.pos().y()]}
+
+
+def apply_transform_state(item, state: dict) -> None:
+    item.setTransform(QTransform.fromScale(float(state.get("sx", 1.0)),
+                                           float(state.get("sy", 1.0))))
+    pos = state.get("pos")
+    if pos:
+        item.setPos(QPointF(float(pos[0]), float(pos[1])))
+
+
+def resize_by_transform(item, index: int, point: QPointF,
+                        keep_aspect: bool = False) -> None:
+    """按手柄拖动结果给图形项套一个缩放 transform（笔迹/图片/组合用）。
+
+    用 transform 而不是改几何：笔迹的采样点、组合里的子项都保持原样，
+    线宽与内容会跟着一起放大，看起来才自然。
+    """
+    from canvas.resize import resized_rect
+
+    scene_rect = item.resize_rect()
+    if scene_rect.width() <= 0 or scene_rect.height() <= 0:
+        return
+    target = resized_rect(scene_rect, index, point, keep_aspect)
+    old = item.transform()
+    sx = old.m11() * target.width() / scene_rect.width()
+    sy = old.m22() * target.height() / scene_rect.height()
+    local = QRectF(item.boundingRect())
+    item.prepareGeometryChange()
+    item.setTransform(QTransform.fromScale(sx, sy))
+    # 局部左上角要跟着补回来：否则内容会整体偏移（局部原点通常不在左上角）
+    item.setPos(QPointF(target.left() - local.left() * sx,
+                        target.top() - local.top() * sy))
+    item.update()
+
+
 def rounded_rect_path(rect: QRectF, radius: float) -> QPainterPath:
     path = QPainterPath()
     limit = min(rect.width(), rect.height()) / 2.0
@@ -384,6 +503,32 @@ class RectItem(QGraphicsPathItem):
     def boundingRect(self) -> QRectF:
         return pen_bounds(self.path(), self.pen().widthF())
 
+    # ---------------------------------------------------------- 自由伸缩
+    def is_resizable(self) -> bool:
+        return True
+
+    def resize_rect(self) -> QRectF:
+        return self.mapRectToScene(self.rect())
+
+    def resize_state(self) -> dict:
+        state = rect_state(self)
+        state["radius"] = round(self._radius, 3)
+        return state
+
+    def restore_resize_state(self, state: dict) -> None:
+        self._radius = max(0.0, float(state.get("radius", self._radius)))
+        apply_rect_state(self, state)
+
+    def resize_with(self, index: int, point: QPointF,
+                    keep_aspect: bool = False) -> None:
+        # 圆角半径按比例跟着缩放，否则拉大之后圆角就看不见了
+        resize_geometry(self, index, point, keep_aspect,
+                        on_radius=self._scale_radius)
+
+    def _scale_radius(self, ratio: float) -> None:
+        if self._radius > 0:
+            self._radius = max(1.0, self._radius * ratio)
+
     # -- 序列化 --
     def to_dict(self) -> dict:
         return _common_geometry_dict(self, "round_rect" if self._radius > 0 else "rect")
@@ -420,6 +565,23 @@ class EllipseItem(QGraphicsEllipseItem):
     def boundingRect(self) -> QRectF:
         margin = self.pen().widthF() / 2.0 + 1.0
         return QRectF(self.rect()).adjusted(-margin, -margin, margin, margin)
+
+    # ---------------------------------------------------------- 自由伸缩
+    def is_resizable(self) -> bool:
+        return True
+
+    def resize_rect(self) -> QRectF:
+        return self.mapRectToScene(self.rect())
+
+    def resize_state(self) -> dict:
+        return rect_state(self)
+
+    def restore_resize_state(self, state: dict) -> None:
+        apply_rect_state(self, state)
+
+    def resize_with(self, index: int, point: QPointF,
+                    keep_aspect: bool = False) -> None:
+        resize_geometry(self, index, point, keep_aspect)
 
     def to_dict(self) -> dict:
         return _common_geometry_dict(self, "ellipse")
@@ -500,6 +662,23 @@ class PolygonShapeItem(QGraphicsPathItem):
 
     def boundingRect(self) -> QRectF:
         return pen_bounds(self.path(), self.pen().widthF())
+
+    # ---------------------------------------------------------- 自由伸缩
+    def is_resizable(self) -> bool:
+        return True
+
+    def resize_rect(self) -> QRectF:
+        return self.mapRectToScene(self.rect())
+
+    def resize_state(self) -> dict:
+        return rect_state(self)
+
+    def restore_resize_state(self, state: dict) -> None:
+        apply_rect_state(self, state)
+
+    def resize_with(self, index: int, point: QPointF,
+                    keep_aspect: bool = False) -> None:
+        resize_geometry(self, index, point, keep_aspect)
 
     def to_dict(self) -> dict:
         return _common_geometry_dict(self, self._kind)
@@ -604,6 +783,108 @@ class LineItem(QGraphicsItem):
         for head in self.arrow_heads():
             path.addPolygon(head)
         return stroked_shape(path, self._pen.widthF())
+
+    # ---------------------------------------------------------- 自由伸缩
+    def is_resizable(self) -> bool:
+        return True
+
+    def resize_rect(self) -> QRectF:
+        """线段的包围盒。
+
+        水平/垂直线的包围盒某个方向为 0，8 个手柄会叠在一起没法抓，
+        所以给一个最小可视厚度（缩放计算用同一个矩形，不影响结果）。
+        """
+        rect = QRectF(QPointF(self._p1), QPointF(self._p2)).normalized()
+        margin = self._pen.widthF() / 2.0 + 1.0
+        rect = rect.adjusted(-margin, -margin, margin, margin)
+        minimum = 6.0
+        if rect.height() < minimum:
+            grow = (minimum - rect.height()) / 2.0
+            rect.adjust(0.0, -grow, 0.0, grow)
+        if rect.width() < minimum:
+            grow = (minimum - rect.width()) / 2.0
+            rect.adjust(-grow, 0.0, grow, 0.0)
+        return self.mapRectToScene(rect)
+
+    def resize_state(self) -> dict:
+        return {
+            "p1": [self._p1.x(), self._p1.y()],
+            "p2": [self._p2.x(), self._p2.y()],
+            "pos": [self.pos().x(), self.pos().y()],
+        }
+
+    def restore_resize_state(self, state: dict) -> None:
+        p1 = state.get("p1")
+        p2 = state.get("p2")
+        if p1 and p2:
+            self.set_endpoints(QPointF(float(p1[0]), float(p1[1])),
+                               QPointF(float(p2[0]), float(p2[1])))
+        pos = state.get("pos")
+        if pos:
+            self.setPos(QPointF(float(pos[0]), float(pos[1])))
+
+    def resize_with(self, index: int, point: QPointF,
+                    keep_aspect: bool = False) -> None:
+        """缩放线段：两个端点按同一比例缩放（线宽不变）。
+
+        几何换算基于**紧贴端点的矩形**，而不是带画笔余量的手柄框 ——
+        否则那条固定宽度的余量会被一起缩放，线段两端会往里缩几像素。
+        """
+        from canvas.resize import (BOTTOM_HANDLES, LEFT_HANDLES, RIGHT_HANDLES,
+                                   TOP_HANDLES, resized_rect)
+
+        scene_p1 = self.mapToScene(self._p1)
+        scene_p2 = self.mapToScene(self._p2)
+        tight = QRectF(scene_p1, scene_p2).normalized()
+        span_x = abs(scene_p2.x() - scene_p1.x())
+        span_y = abs(scene_p2.y() - scene_p1.y())
+        if span_x <= 1e-6 and span_y <= 1e-6:
+            return
+        # 退化方向给一个极小尺寸，避免除零（结果会被下面的方向判断覆盖）
+        probe = QRectF(tight)
+        if probe.width() <= 1e-6:
+            probe.setWidth(1e-6)
+        if probe.height() <= 1e-6:
+            probe.setHeight(1e-6)
+        target = resized_rect(probe, index, point, keep_aspect)
+
+        left, right = tight.left(), tight.right()
+        top, bottom = tight.top(), tight.bottom()
+        if span_x > 1e-6 and index in LEFT_HANDLES + RIGHT_HANDLES:
+            if index in LEFT_HANDLES:
+                left = right - abs(target.width())
+            else:
+                right = left + abs(target.width())
+        if span_y > 1e-6 and index in TOP_HANDLES + BOTTOM_HANDLES:
+            if index in TOP_HANDLES:
+                top = bottom - abs(target.height())
+            else:
+                bottom = top + abs(target.height())
+
+        width = max(right - left, 1e-6)
+        height = max(bottom - top, 1e-6)
+        sx = width / tight.width() if span_x > 1e-6 else 1.0
+        sy = height / tight.height() if span_y > 1e-6 else 1.0
+        fixed_left = index in RIGHT_HANDLES      # 拖左边时右边不动
+        fixed_top = index in BOTTOM_HANDLES
+
+        def mapped(point_in_scene: QPointF) -> QPointF:
+            if span_x <= 1e-6:
+                x = point_in_scene.x()
+            elif fixed_left:
+                x = right - (tight.right() - point_in_scene.x()) * sx
+            else:
+                x = left + (point_in_scene.x() - tight.left()) * sx
+            if span_y <= 1e-6:
+                y = point_in_scene.y()
+            elif fixed_top:
+                y = bottom - (tight.bottom() - point_in_scene.y()) * sy
+            else:
+                y = top + (point_in_scene.y() - tight.top()) * sy
+            return QPointF(x, y)
+
+        self.set_endpoints(self.mapFromScene(mapped(scene_p1)),
+                           self.mapFromScene(mapped(scene_p2)))
 
     def paint(self, painter: QPainter, option, widget=None) -> None:
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
@@ -940,6 +1221,121 @@ class ImageItem(QGraphicsPixmapItem):
         return item
 
 
+# ------------------------------------------------------------------ 组合
+
+
+class GroupItem(QGraphicsItemGroup):
+    """把若干图形项组合成一个整体（Ctrl+G）。
+
+    组合之后它就像「一个常规图形」：点击/框选选中的是整个组，拖动整体移动，
+    拖手柄整体缩放（走 transform，里面的内容一起变大变小），橡皮碰到整体删除；
+    拆开（Ctrl+Shift+G）后各回原位。
+
+    几个必须注意的点：
+
+    * ``QGraphicsItemGroup`` 默认**不可选中**，要自己打开 ``ItemIsSelectable``；
+    * 场景的命中测试会把「组」当成一个整体返回（组里的子项不会被单独点到），
+      但 ``scene.items()`` 仍然会列出子项 —— 序列化那边靠
+      ``parentItem() is not None`` 把它们跳过，由组自己负责保存子项；
+    * 组要保持 ``pos=(0,0)``、无变换地加入子项，子项的场景位置才不会变；
+    * 组的缩放记在 ``transform`` 上（``sx``/``sy``），子项自身保持不变。
+    """
+
+    TYPE = "group"
+
+    def __init__(self, items=None):
+        super().__init__()
+        self._children: list = []
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
+        for item in (items or []):
+            self.add_item(item)
+
+    # ---------------------------------------------------------- 成员管理
+    def add_item(self, item) -> None:
+        """把图形项收进组里（保持它原来的场景位置）。
+
+        必须用 Qt 的 :meth:`QGraphicsItemGroup.addToGroup`，不能自己
+        ``setParentItem(self)`` —— 后者绕过了组内部的成员表，组会算不出
+        ``boundingRect()``（选中框、手柄、命中测试全都跟着失效，
+        表现为「组合后选不中也缩放不了」）。
+        """
+        if item is None or item is self:
+            return
+        # 组处于 (0,0) 且无变换时，addToGroup 保持子项的局部坐标
+        # （也就是它原来的场景坐标），场景位置因此不变。
+        item.setSelected(False)
+        self.addToGroup(item)
+        if item not in self._children:
+            self._children.append(item)
+
+    def children_items(self) -> list:
+        return list(self._children)
+
+    def remove_item(self, item) -> None:
+        """把图形项移出组。
+
+        Qt 的 ``removeFromGroup()`` **会自己保持子项的场景位置与变换**
+        （它把组的变换补进子项的 pos/transform 里），所以这里不需要再做什么 ——
+        曾经手动补偿过一次，结果缩放被叠加了两遍（拆组后图形突然变大一倍）。
+        """
+        self.removeFromGroup(item)
+        for index, child in enumerate(self._children):
+            if child is item:
+                del self._children[index]
+                break
+
+    # ---------------------------------------------------------- 自由伸缩
+    def is_resizable(self) -> bool:
+        # 只有一个子项时没必要缩放「组」，直接选那个子项更好
+        return bool(self._children)
+
+    def resize_rect(self) -> QRectF:
+        return self.mapRectToScene(self.boundingRect())
+
+    def resize_state(self) -> dict:
+        return transform_state(self)
+
+    def restore_resize_state(self, state: dict) -> None:
+        apply_transform_state(self, state)
+
+    def resize_with(self, index: int, point: QPointF,
+                    keep_aspect: bool = False) -> None:
+        resize_by_transform(self, index, point, keep_aspect)
+
+    def scene_scale(self) -> float:
+        return item_scene_scale(self)
+
+    # ---------------------------------------------------------- 序列化
+    def to_dict(self) -> dict:
+        transform = self.transform()
+        return {
+            "type": self.TYPE,
+            "pos": [self.pos().x(), self.pos().y()],
+            "sx": round(transform.m11(), 6),
+            "sy": round(transform.m22(), 6),
+            "items": [child.to_dict() for child in self._children
+                      if getattr(child, "to_dict", None) is not None],
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "GroupItem":
+        item = cls()
+        # 先按「单位变换、原点」把子项收进来，再设置组的位移/缩放：
+        # QGraphicsItemGroup.addToGroup() **会保持子项的场景位置**，
+        # 所以如果先设好组的变换，子项的局部坐标会被反过来补偿掉，
+        # 组一加载就会整体错位。
+        for child_data in data.get("items", []):
+            child = item_from_dict(child_data)
+            if child is not None:
+                item.add_item(child)
+        item.setTransform(QTransform.fromScale(float(data.get("sx", 1.0)),
+                                               float(data.get("sy", 1.0))))
+        pos = data.get("pos")
+        if pos:
+            item.setPos(QPointF(float(pos[0]), float(pos[1])))
+        return item
+
+
 # ------------------------------------------------------------------ 工厂
 
 
@@ -951,6 +1347,7 @@ _TYPE_MAP = {
     LineItem.TYPE: LineItem,
     TextItem.TYPE: TextItem,
     ImageItem.TYPE: ImageItem,
+    GroupItem.TYPE: GroupItem,
 }
 
 ITEM_TYPES = tuple(_TYPE_MAP.keys())

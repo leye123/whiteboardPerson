@@ -21,6 +21,7 @@ from PySide6.QtCore import QPointF, Qt
 
 from canvas.items import (
     EllipseItem,
+    GroupItem,
     ImageItem,
     LineItem,
     PolygonShapeItem,
@@ -34,8 +35,9 @@ from core.history import ReplaceItemsCommand
 from core.stroke import cumulative_lengths, split_by_eraser
 from tools.base_tool import BaseTool
 
-# 无法擦断、只能整体删除的图形（形状/文字/图片都属此类）
-_WHOLE_ERASE = (LineItem, RectItem, EllipseItem, PolygonShapeItem, TextItem, ImageItem)
+# 无法擦断、只能整体删除的图形（形状/文字/图片/组合都属此类）
+_WHOLE_ERASE = (LineItem, RectItem, EllipseItem, PolygonShapeItem, TextItem,
+                ImageItem, GroupItem)
 # 擦断后少于这个点数的碎片直接丢弃（1 个点只剩个圆点，没有保留价值）
 MIN_SEGMENT_POINTS = 2
 
@@ -121,7 +123,13 @@ class EraserTool(BaseTool):
         points = item.points()
         if not points:
             return
-        runs = split_by_eraser(points, center, radius, item.pos())
+        # 笔迹可能被缩放过（自由伸缩会给它套 transform），所以先把橡皮圆心
+        # 换算到笔迹的**局部坐标**、半径按缩放倍数折算，再按局部坐标切分。
+        # 否则缩放过的笔迹只能被擦到一半（局部坐标与场景坐标不再重合）。
+        inverse, invertible = item.sceneTransform().inverted()
+        local_center = inverse.map(center) if invertible else QPointF(center)
+        scale = item.scene_scale()
+        runs = split_by_eraser(points, local_center, radius / max(scale, 1e-6))
         if len(runs) == 1 and len(runs[0]) == len(points):
             return                                   # 圆没碰到这条笔画
         segments = [run for run in runs if len(run) >= MIN_SEGMENT_POINTS]
@@ -129,6 +137,7 @@ class EraserTool(BaseTool):
         pen = item.pen()
         style = line_style_name(pen.style())
         origin = QPointF(item.pos())
+        transform = item.transform()
         # 虚线相位：碎片要知道自己「从原笔迹多长的地方开始」，
         # 否则虚线图案会在断口处重新起头，断口之后的虚线整段移位。
         lengths = cumulative_lengths(points)
@@ -141,10 +150,12 @@ class EraserTool(BaseTool):
             except ValueError:                       # 理论上不会发生
                 start_index = cursor
             cursor = start_index
-            # 碎片要继承原笔迹的颜色/线宽/线型，否则擦一下虚线会变成实线
+            # 碎片要继承原笔迹的颜色/线宽/线型/缩放，否则擦一下虚线会变成实线、
+            # 缩放过的笔迹会突然跳回原始大小
             segment = StrokeItem(run, pen.color(), pen.widthF(), pos=origin,
                                  line_style=style,
                                  dash_offset=base_offset + lengths[start_index])
+            segment.setTransform(transform)
             scene.addItem(segment)
             self._added.append(segment)
 

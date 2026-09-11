@@ -671,17 +671,63 @@ def main() -> int:
     app.processEvents()
     ok(text_item.font().pixelSize() == size_before, "文字缩放可撤销")
 
-    # ---- 18c. 笔迹/形状没有缩放手柄（尺寸靠重新绘制）
+    # ---- 18c. 形状/笔迹/文字/图片都能自由伸缩（拖手柄）
+    def drag_handle(item, handle_index, delta: QPoint):
+        """选中 item 后拖动它的某个手柄。"""
+        scene.clearSelection()
+        item.setSelected(True)
+        app.processEvents()
+        points = win.view.handle_points_view()
+        corner = points[handle_index]
+        drag(vp, QPoint(int(corner.x()), int(corner.y())),
+             [QPoint(int(corner.x()) + delta.x(), int(corner.y()) + delta.y())])
+        app.processEvents()
+
+    # 矩形：改的是几何（线宽不变）
+    scene = fresh_scene()
+    win.set_active_tool("rect")
+    drag(vp, QPoint(200, 200), [QPoint(300, 260)])
+    app.processEvents()
+    win.set_active_tool("selector")
+    shape = [it for it in scene.items() if isinstance(it, RectItem)][0]
+    scene.clearSelection()
+    shape.setSelected(True)
+    app.processEvents()
+    ok(win.view.resize_target() is shape, "矩形也能自由伸缩（出现手柄）")
+    shape_before = shape.resize_rect()
+    pen_before = shape.pen().widthF()
+    drag_handle(shape, 4, QPoint(80, 60))
+    shape_after = shape.resize_rect()
+    ok(shape_after.width() > shape_before.width() + 20
+       and shape_after.height() > shape_before.height() + 20,
+       f"拖手柄把矩形拉大（{shape_before.width():.0f}x{shape_before.height():.0f} -> "
+       f"{shape_after.width():.0f}x{shape_after.height():.0f}）")
+    ok(abs(shape.pen().widthF() - pen_before) < 0.01, "缩放矩形时线宽保持不变")
+    win.undo_stack.undo()
+    app.processEvents()
+    ok(abs(shape.resize_rect().width() - shape_before.width()) < 0.5, "形状缩放可撤销")
+
+    # 画笔笔迹：改的是 transform（线宽跟着一起放大）
     scene = fresh_scene()
     win.set_active_tool("pen")
-    drag(vp, QPoint(200, 200), [QPoint(260, 240)])
+    drag(vp, QPoint(200, 200), [QPoint(240, 220), QPoint(300, 250)])
     app.processEvents()
     win.set_active_tool("selector")
     stroke_item = [it for it in scene.items() if isinstance(it, StrokeItem)][0]
+    scene.clearSelection()
     stroke_item.setSelected(True)
     app.processEvents()
-    ok(win.view.resize_target() is None and win.view.handle_points_view() == [],
-       "笔迹与形状不显示缩放手柄")
+    ok(win.view.resize_target() is stroke_item, "画笔画的笔迹也能自由伸缩")
+    stroke_before = stroke_item.resize_rect()
+    drag_handle(stroke_item, 4, QPoint(100, 70))
+    stroke_after = stroke_item.resize_rect()
+    ok(stroke_after.width() > stroke_before.width() + 20,
+       f"拖手柄把笔迹拉大（{stroke_before.width():.0f} -> {stroke_after.width():.0f}）")
+    ok(stroke_item.scene_scale() > 1.2,
+       f"笔迹缩放倍数生效（{stroke_item.scene_scale():.2f}）")
+    win.undo_stack.undo()
+    app.processEvents()
+    ok(abs(stroke_item.scene_scale() - 1.0) < 0.01, "笔迹缩放可撤销")
 
     # ---- 18d. 手柄真的画出来了（叠加层绘制路径）
     scene = fresh_scene()
@@ -819,6 +865,128 @@ def main() -> int:
     ok(entered and dropped, "拖到画布视口（Qt 实际投递的控件）能导入")
     ok(len([it for it in scene.items() if isinstance(it, ImageItem)]) == 1,
        "视口路径把图片导入当前页")
+
+    # ---- 20. 组合（Ctrl+G）：整体选中 / 移动 / 自由缩放 / 存读 / 拆开
+    from canvas.items import GroupItem, PolygonShapeItem
+    from persistence import serializer
+
+    scene = fresh_scene()
+    win.set_active_tool("rect")
+    drag(vp, QPoint(200, 200), [QPoint(300, 260)])
+    app.processEvents()
+    win.set_active_tool("star")
+    drag(vp, QPoint(360, 200), [QPoint(440, 270)])
+    app.processEvents()
+    win.set_active_tool("selector")
+    pieces = [it for it in scene.items()
+              if isinstance(it, (RectItem, PolygonShapeItem))]
+    ok(len(pieces) == 2, "准备好两个图形用于组合")
+    ok(win._edit_menu_actions["group"].shortcut().toString() == "Ctrl+G",
+       "「组合」绑定在 Ctrl+G 上")
+    ok(win._edit_menu_actions["ungroup"].shortcut().toString() == "Ctrl+Shift+G",
+       "「取消组合」绑定在 Ctrl+Shift+G 上")
+
+    scene.clearSelection()
+    for piece in pieces:
+        piece.setSelected(True)
+    app.processEvents()
+    ok(win._edit_menu_actions["group"].isEnabled(), "选中两个对象后「组合」可用")
+    win.group_selected()
+    app.processEvents()
+    groups = [it for it in scene.items() if isinstance(it, GroupItem)]
+    ok(len(groups) == 1, "Ctrl+G 生成了一个组合")
+    group = groups[0]
+    ok(len(group.children_items()) == 2, "组合里有 2 个成员")
+    ok(all(piece.parentItem() is group for piece in pieces), "两个图形都挂到了组合上")
+    ok(group.isSelected(), "组合后自动选中整个组合")
+    ok(win.view.resize_target() is group, "组合像常规图形一样可以自由伸缩")
+
+    # 组合的成员不能再被单独点到（命中测试返回的是组合本身）
+    probe = pieces[0].sceneBoundingRect().center()
+    hit = scene.topmost_item_at(probe)
+    ok(hit is group, f"点击成员命中的是整个组合（{type(hit).__name__}）")
+
+    # 移动整体：两个成员一起动，且只产生一个撤销步骤
+    positions_before = [piece.scenePos() for piece in pieces]
+    steps_before = win.undo_stack.index()
+    origin = group.boundingRect().center()
+    drag(vp, win.view.mapFromScene(origin),
+         [QPoint(int(win.view.mapFromScene(origin).x()) + 60,
+                 int(win.view.mapFromScene(origin).y()) + 40)])
+    app.processEvents()
+    moved = [piece.scenePos() - before
+             for piece, before in zip(pieces, positions_before)]
+    ok(all(abs(delta.x() - moved[0].x()) < 0.5 and abs(delta.y() - moved[0].y()) < 0.5
+           for delta in moved) and abs(moved[0].x()) > 10,
+       f"拖动组合时成员一起移动（位移 {moved[0].x():.0f},{moved[0].y():.0f}）")
+    ok(win.undo_stack.index() == steps_before + 1, "整体移动只产生一个撤销步骤")
+    win.undo_stack.undo()
+    app.processEvents()
+
+    # 缩放整体：成员跟着变大
+    before_rect = group.resize_rect()
+    drag_handle(group, 4, QPoint(120, 90))
+    after_rect = group.resize_rect()
+    ok(after_rect.width() > before_rect.width() + 20,
+       f"拖动组合的手柄整体缩放（{before_rect.width():.0f} -> {after_rect.width():.0f}）")
+    ok(group.scene_scale() > 1.1, "组合缩放倍数生效")
+
+    # 存盘再读回来：组合要完整保留
+    doc = serializer.document_to_dict(win.pages, win.page_index)
+    pages2, cur2 = serializer.document_from_dict(doc)
+    reloaded = [it for it in pages2[cur2].scene.items()
+                if isinstance(it, GroupItem)]
+    ok(len(reloaded) == 1 and len(reloaded[0].children_items()) == 2,
+       f"组合能完整保存/读取（组合数 {len(reloaded)}，"
+       f"成员数 {len(reloaded[0].children_items()) if reloaded else '-'}）")
+    ok(abs(reloaded[0].scene_scale() - group.scene_scale()) < 0.01,
+       "读回来的组合缩放倍数一致")
+
+    # 取消组合：成员回到场景顶层，外观不变，且可撤销
+    scene.clearSelection()
+    group.setSelected(True)
+    app.processEvents()
+    ok(win._edit_menu_actions["ungroup"].isEnabled(), "选中组合后「取消组合」可用")
+    members_before = [(piece, piece.scenePos(), piece.sceneBoundingRect())
+                      for piece in group.children_items()]
+    win.ungroup_selected()
+    app.processEvents()
+    ok(not [it for it in scene.items() if isinstance(it, GroupItem)],
+       "Ctrl+Shift+G 拆开了组合")
+    ok(all(piece.parentItem() is None and piece.scene() is scene
+           for piece, _pos, _rect in members_before),
+       "拆开后成员回到场景里（不再有父项）")
+    for piece, pos_before, rect_before in members_before:
+        now = piece.sceneBoundingRect()
+        ok(abs(now.x() - rect_before.x()) < 1.0 and abs(now.width() - rect_before.width()) < 1.0,
+           f"拆开后成员外观不变（{rect_before.width():.0f} -> {now.width():.0f}）")
+    win.undo_stack.undo()
+    app.processEvents()
+    ok(len([it for it in scene.items() if isinstance(it, GroupItem)]) == 1,
+       "取消组合可以撤销（组合回来了）")
+
+    # ---- 20b. 真实按键也能触发组合/取消组合（走 Qt 的快捷键机制）
+    from PySide6.QtTest import QTest
+
+    scene = fresh_scene()
+    win.set_active_tool("rect")
+    drag(vp, QPoint(200, 200), [QPoint(280, 250)])
+    drag(vp, QPoint(340, 200), [QPoint(420, 250)])
+    app.processEvents()
+    win.set_active_tool("selector")
+    scene.clearSelection()
+    for piece in [it for it in scene.items() if isinstance(it, RectItem)]:
+        piece.setSelected(True)
+    app.processEvents()
+    QTest.keyClick(win, Qt.Key.Key_G, Qt.KeyboardModifier.ControlModifier)
+    app.processEvents()
+    ok(len([it for it in scene.items() if isinstance(it, GroupItem)]) == 1,
+       "按真实 Ctrl+G 键即可组合")
+    QTest.keyClick(win, Qt.Key.Key_G,
+                   Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier)
+    app.processEvents()
+    ok(not [it for it in scene.items() if isinstance(it, GroupItem)],
+       "按真实 Ctrl+Shift+G 键即可取消组合")
 
     print(f"\n全部 {checks} 项冒烟检查通过")
     return 0
