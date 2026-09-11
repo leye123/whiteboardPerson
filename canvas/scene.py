@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from PySide6.QtCore import QPointF, QRectF, Qt
-from PySide6.QtGui import QColor, QPainter, QPolygonF
+from PySide6.QtGui import QColor, QPainter, QPainterPath, QPolygonF
 from PySide6.QtWidgets import QGraphicsScene
 
 # 网格在屏幕上的最小/最大间距（像素）。缩放时自动切换网格密度，
@@ -11,6 +11,32 @@ GRID_MIN_PX = 14.0
 GRID_MAX_PX = 56.0
 # 单次重绘最多画多少个网格点（防止极端缩放下的卡顿）
 GRID_MAX_POINTS = 6000
+
+
+def item_hits_interior(item, scene_point) -> bool:
+    """点是否落在闭合图形的**内部**（矩形 / 椭圆 / 多边形才有这个路径）。
+
+    自交路径（五角星）要用 WindingFill 判定，否则正中心会被奇偶规则
+    判成"外面"，用户点在星星中间反而选不中。
+
+    先用 ``sceneBoundingRect()`` 做一次廉价的矩形预筛：这个方法在鼠标移动
+    （悬停换光标）时也会被调到，白板上图形多的时候不该每个图形都去构造路径。
+    """
+    getter = getattr(item, "interior_path", None)
+    if not callable(getter):
+        return False
+    try:
+        if not item.sceneBoundingRect().contains(scene_point):
+            return False
+        local = item.mapFromScene(scene_point)
+        path = getter()
+    except RuntimeError:
+        return False                    # 图形项正在析构
+    if path is None or path.isEmpty():
+        return False
+    path = QPainterPath(path)               # 复制一份，不动图形项自己那份
+    path.setFillRule(Qt.FillRule.WindingFill)
+    return path.contains(local)
 
 
 class WhiteboardScene(QGraphicsScene):
@@ -109,15 +135,32 @@ class WhiteboardScene(QGraphicsScene):
         painter.restore()
 
     # ------------------------------------------------------------- 便捷查询
-    def items_at(self, scene_point, radius: float = 4.0) -> list:
-        """返回场景坐标点附近（半径内）的所有顶层图形项。"""
-        if radius <= 0:
-            return [it for it in self.items(scene_point) if not it.parentItem()]
-        rect = QRectF(scene_point.x() - radius, scene_point.y() - radius,
-                      radius * 2, radius * 2)
-        return [it for it in self.items(rect, Qt.ItemSelectionMode.IntersectsItemShape)
-                if not it.parentItem()]
+    def items_at(self, scene_point, radius: float = 4.0,
+                 interior: bool = False) -> list:
+        """返回场景坐标点附近（半径内）的所有顶层图形项。
 
-    def topmost_item_at(self, scene_point, radius: float = 4.0):
-        found = self.items_at(scene_point, radius)
+        ``interior=True`` 时**闭合图形的内部空白也算命中**：矩形 / 椭圆 /
+        多边形默认没有填充，``shape()`` 只有描边那一圈，点在图形中间会
+        什么都点不到（选不中、也没法双击进去写字）。选择工具用这个模式，
+        橡皮擦仍用默认的按描边判定，免得点一下空白就把整个大框擦掉。
+
+        返回顺序始终是"从最上层到最下层"。
+        """
+        if radius <= 0:
+            found = [it for it in self.items(scene_point) if not it.parentItem()]
+        else:
+            rect = QRectF(scene_point.x() - radius, scene_point.y() - radius,
+                          radius * 2, radius * 2)
+            found = [it for it in self.items(rect, Qt.ItemSelectionMode.IntersectsItemShape)
+                     if not it.parentItem()]
+        if not interior:
+            return found
+        strict = {id(it) for it in found}
+        return [it for it in self.items()
+                if not it.parentItem()
+                and (id(it) in strict or item_hits_interior(it, scene_point))]
+
+    def topmost_item_at(self, scene_point, radius: float = 4.0,
+                        interior: bool = False):
+        found = self.items_at(scene_point, radius, interior=interior)
         return found[0] if found else None

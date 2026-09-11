@@ -16,6 +16,7 @@ from typing import Dict, Iterable, List, Optional, Sequence
 
 from PySide6.QtCore import QPointF
 from PySide6.QtGui import QUndoCommand, QUndoStack
+from shiboken6 import isValid
 
 from core.text_format import TextFormat
 
@@ -295,6 +296,40 @@ class UngroupItemsCommand(QUndoCommand):
             self._group.add_item(item)
         if self._group.scene() is not self._scene:
             self._scene.addItem(self._group)
+
+
+# ------------------------------------------------------------------ 参数修改
+
+
+class StyleStatesCommand(QUndoCommand):
+    """一次参数调节（可能同时作用于多个对象）：快照式，可撤销。
+
+    参数侧边栏是「边调边看」的：改动已经实时应用在图形项上，
+    这个命令只攒下「改之前 / 改之后」两份快照供撤销重做使用
+    （主窗口把连续调节去抖成一次命令，所以拖滑块不会塞满撤销栈）。
+    """
+
+    def __init__(self, old_states: Dict, new_states: Dict,
+                 text: str = "修改参数", parent=None) -> None:
+        super().__init__(text, parent)
+        self._old = {item: state for item, state in (old_states or {}).items()
+                     if item is not None and state}
+        self._new = {item: state for item, state in (new_states or {}).items()
+                     if item is not None and state}
+
+    def _apply(self, states: Dict) -> None:
+        for item, state in states.items():
+            if not isValid(item):
+                continue
+            restore = getattr(item, "restore_style_state", None)
+            if callable(restore):
+                restore(state)
+
+    def redo(self) -> None:
+        self._apply(self._new)
+
+    def undo(self) -> None:
+        self._apply(self._old)
 
 
 # ------------------------------------------------------------------ 工具函数

@@ -40,6 +40,7 @@ class WhiteboardView(QGraphicsView):
         self.current_tool = None
         self._overlay = None          # 视口叠加层（橡皮擦范围圈）
         self._selection_boxes = set()  # 上一次绘制的选中框（视口坐标），用于重绘
+        self._placeholder_boxes = set()  # 上一次绘制的「空字体框」占位框
         self._last_dirty_region = QRegion()
         # 注意：QGraphicsView(scene) 这种构造方式不会调用 Python 覆盖的 setScene()，
         # 初始场景必须在这里显式连接，否则首页的 selectionChanged 收不到。
@@ -304,20 +305,49 @@ class WhiteboardView(QGraphicsView):
             boxes.add((rect.x(), rect.y(), rect.width(), rect.height()))
         return boxes
 
+    def _placeholder_boxes_now(self) -> set:
+        """空字体框的占位虚线框（视口坐标）。
+
+        新建的字体框是空的，不画点什么用户根本找不到它（也点不中）。
+        画在视口叠加层：不进 `.wbd`、不会出现在导出的 PNG 里。
+        """
+        boxes = set()
+        scene = self.scene()
+        if scene is None:
+            return boxes
+        for item in scene.items():
+            is_empty = getattr(item, "is_empty", None)
+            is_box = getattr(item, "is_box", None)
+            if not (callable(is_empty) and callable(is_box)):
+                continue
+            try:
+                if not (item.isVisible() and is_box() and is_empty()):
+                    continue
+                rect = self.mapFromScene(item.resize_rect()).boundingRect()
+            except (RuntimeError, AttributeError):
+                continue          # 图形项正在析构
+            if not rect.isEmpty():
+                boxes.add((rect.x(), rect.y(), rect.width(), rect.height()))
+        return boxes
+
     def _invalidate_selection_boxes(self, boxes: set) -> None:
         """把「缓存里的旧框 ∪ 新框」标记为脏。
 
-        选中框画在视口叠加层上（不是图形项），Qt 的增量重绘不会刷新它，
-        所以必须自己失效对应区域，否则框选/取消选中/移动之后框会留在屏幕上。
+        选中框与空字体框占位框都画在视口叠加层上（不是图形项），
+        Qt 的增量重绘不会刷新它们，所以必须自己失效对应区域，
+        否则框选/取消选中/移动、或者给空框输入文字之后，旧框会留在屏幕上。
         外扩的量要盖住缩放手柄（手柄画在框线上，向两侧各伸出半个手柄）。
         """
         margin = resize.HANDLE_SIZE_PX
+        placeholders = self._placeholder_boxes_now()
         dirty = QRegion()
-        for box in getattr(self, "_selection_boxes", set()) | boxes:
+        for box in (getattr(self, "_selection_boxes", set()) | boxes
+                    | getattr(self, "_placeholder_boxes", set()) | placeholders):
             dirty += QRegion(QRect(int(box[0]) - margin, int(box[1]) - margin,
                                    int(box[2]) + margin * 2 + 1,
                                    int(box[3]) + margin * 2 + 1))
         self._selection_boxes = boxes
+        self._placeholder_boxes = placeholders
         self._last_dirty_region = dirty          # 便于自检/排查
         if not dirty.isEmpty():
             self.viewport().update(dirty)
@@ -404,10 +434,26 @@ class WhiteboardView(QGraphicsView):
         super().paintEvent(event)
         painter = QPainter(self.viewport())
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        self._draw_text_placeholders(painter)
         self._draw_selection_boxes(painter)
         self._draw_resize_handles(painter)
         self._draw_tool_overlay(painter)
         painter.end()
+
+    def _draw_text_placeholders(self, painter: QPainter) -> None:
+        """空字体框画一圈浅色虚线，提示这里可以双击输入文字。"""
+        if not self._placeholder_boxes:
+            return
+        pen = QPen(QColor(150, 158, 168, 200), 1.0)
+        pen.setStyle(Qt.PenStyle.DashLine)
+        pen.setCosmetic(True)
+        painter.save()
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        for box in self._placeholder_boxes:
+            painter.drawRect(QRect(int(box[0]), int(box[1]),
+                                   int(box[2]), int(box[3])))
+        painter.restore()
 
     def _draw_selection_boxes(self, painter: QPainter) -> None:
         """画选中虚线框。

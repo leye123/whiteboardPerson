@@ -1,18 +1,29 @@
-"""文字工具：点击画布后弹出对话框输入文本与排版，确定后插入。
+"""文字工具：先在画布上拖出**字体框**，再双击进去输入文字（v1.3.0 起）。
 
-对话框支持选择字体、字号、颜色、粗斜体、对齐与自动换行，也可以导入字体文件
-（见 :mod:`widgets.text_dialog` 与 :mod:`core.fonts`）。
+流程：
+
+1. 选中文字工具后在画布上按住左键拖出框的大小（松开即创建）；
+   直接单击会创建一个默认大小的框，免得必须拖一下才能用；
+2. 双击这个框（选择工具下）即可在**右侧「参数」侧边栏**里输入文字、调字体字号等；
+3. 框的缩放默认**不等比**：拖手柄改的是框本身（宽度决定折行），字号不动。
+
+建好框之后不自动进入输入状态 —— 用户可能只是想先摆好版面。
 """
 from __future__ import annotations
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QPointF, QRectF, Qt
 from PySide6.QtGui import QColor
 
-from canvas.items import TextItem
+from canvas.items import RectItem, TextItem, mark_preview
 from core.history import AddItemCommand
 from core.text_format import TextFormat
 from tools.base_tool import BaseTool
-from widgets.text_dialog import TextDialog, TextEditDialog  # noqa: F401 —— 旧名字兼容
+
+# 直接单击（没拖动）时用的默认框尺寸
+DEFAULT_BOX = (240.0, 80.0)
+# 小于这个拖拽距离就当成「单击」
+CLICK_THRESHOLD = 8.0
+MIN_BOX = 24.0
 
 
 class TextTool(BaseTool):
@@ -30,8 +41,10 @@ class TextTool(BaseTool):
                 pixel_size=float(pixel_size))
         if color is not None:
             self.format.color = QColor(color)
-        self.settings = settings          # 用于记住导入的字体与上次的排版
-        self.format_changed = None        # 可选回调：MainWindow 用它同步颜色按钮
+        self.settings = settings          # 记住上次用过的排版
+        self._start = None
+        self._preview = None
+        self._drawing = False
 
     # ------------------------------------------------------------- 兼容属性
     @property
@@ -52,50 +65,89 @@ class TextTool(BaseTool):
 
     # ------------------------------------------------------------- 事件
     def mousePressEvent(self, event, view) -> None:
-        pos = self.scene_pos(event, view)
-        result = TextDialog.ask(view.window(), "输入文字", "", self.format,
-                                self.settings)
-        if not result:
+        self._start = self.scene_pos(event, view)
+        self._drawing = True
+        self._update_preview(self._start, view)
+        event.accept()
+
+    def mouseMoveEvent(self, event, view) -> None:
+        if not self._drawing or self._start is None:
+            return
+        self._update_preview(self.scene_pos(event, view), view)
+        event.accept()
+
+    def mouseReleaseEvent(self, event, view) -> None:
+        if not self._drawing or self._start is None:
             event.accept()
             return
-        # 兼容旧接口：若被替换成只返回字符串的实现（测试里会这么做）
-        if isinstance(result, tuple):
-            text, fmt = result
-        else:
-            text, fmt = result, self.format
-        self._remember_format(fmt)
+        self._drawing = False
+        end = self.scene_pos(event, view)
+        start = self._start
+        self._start = None
+        self._clear_preview(view)
 
+        rect = self._box_rect(start, end)
         item = TextItem(
-            text, fmt.color, fmt.pixel_size,
-            family=fmt.family, bold=fmt.bold, italic=fmt.italic,
-            wrap=fmt.wrap, text_width=fmt.text_width, align=fmt.align,
-            font_file=fmt.font_file)
-        item.setPos(pos)
+            "", self.format.color, self.format.pixel_size,
+            family=self.format.family, bold=self.format.bold,
+            italic=self.format.italic,
+            text_width=rect.width(), align=self.format.align,
+            font_file=self.format.font_file,
+            box_height=rect.height())
+        item.setPos(rect.topLeft())
+
         scene = view.scene()
         stack = self.undo_stack(view)
         if stack is not None:
-            stack.push(AddItemCommand(scene, item, "添加文字"))
+            stack.push(AddItemCommand(scene, item, "新建字体框"))
         else:
             scene.addItem(item)
+        scene.clearSelection()
+        item.setSelected(True)
+        window = view.window()
+        if hasattr(window, "statusBar"):
+            window.statusBar().showMessage(
+                "字体框已创建：双击它即可输入文字（右侧「参数」侧边栏）", 5000)
         event.accept()
-
-    def _remember_format(self, fmt: TextFormat) -> None:
-        """记住这次用的排版（下次默认沿用），并同步设置与界面颜色。"""
-        self.format = fmt.copy()
-        if self.settings is not None:
-            try:
-                self.settings.set_text_format(self.format)
-                self.settings.sync()
-            except Exception:  # noqa: BLE001 —— 设置写不进去不该影响画布
-                pass
-        if callable(self.format_changed):
-            self.format_changed(self.format)
 
     def mouseDoubleClickEvent(self, event, view) -> None:
         pass
 
-    def mouseMoveEvent(self, event, view) -> None:
-        pass
+    # ------------------------------------------------------------- 生命周期
+    def deactivate(self, view) -> None:
+        self._drawing = False
+        self._start = None
+        self._clear_preview(view)
+        super().deactivate(view)
 
-    def mouseReleaseEvent(self, event, view) -> None:
-        pass
+    # ------------------------------------------------------------- 内部
+    def _box_rect(self, start: QPointF, end: QPointF) -> QRectF:
+        """拖出来的框；单击（几乎没拖动）时用默认尺寸。"""
+        if (abs(end.x() - start.x()) < CLICK_THRESHOLD
+                and abs(end.y() - start.y()) < CLICK_THRESHOLD):
+            width, height = DEFAULT_BOX
+            return QRectF(start.x(), start.y(), width, height)
+        rect = QRectF(start, end).normalized()
+        return QRectF(rect.x(), rect.y(),
+                      max(MIN_BOX, rect.width()), max(MIN_BOX, rect.height()))
+
+    def _update_preview(self, end: QPointF, view) -> None:
+        scene = view.scene()
+        rect = self._box_rect(self._start, end)
+        if self._preview is None:
+            preview = RectItem(rect, QColor(38, 132, 255), 1.0, line_style="dash")
+            mark_preview(preview)
+            preview.setZValue(1e9)
+            scene.addItem(preview)
+            self._preview = preview
+            return
+        self._preview.set_rect(rect)
+
+    def _clear_preview(self, view=None) -> None:
+        preview = self._preview
+        self._preview = None
+        if preview is None:
+            return
+        scene = preview.scene() or (view.scene() if view is not None else None)
+        if scene is not None:
+            scene.removeItem(preview)

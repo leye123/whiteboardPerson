@@ -10,10 +10,8 @@ from PySide6.QtGui import QColor, QPainterPath, QPen
 from PySide6.QtWidgets import QGraphicsRectItem
 
 from canvas.items import TextItem, mark_preview
-from core.history import MoveItemsCommand, ResizeItemCommand, TextFormatCommand
-from core.text_format import TextFormat
+from core.history import MoveItemsCommand, ResizeItemCommand
 from tools.base_tool import BaseTool
-from widgets.text_dialog import TextDialog
 
 
 class SelectorTool(BaseTool):
@@ -53,7 +51,7 @@ class SelectorTool(BaseTool):
                 event.accept()
                 return
 
-        item = scene.topmost_item_at(pos)
+        item = scene.topmost_item_at(pos, interior=True)
 
         if ctrl:
             # Ctrl+点击：切换选中状态，不进入拖拽
@@ -107,7 +105,7 @@ class SelectorTool(BaseTool):
             handle = view.handle_at(event.position().toPoint())
             if handle is not None:
                 view.viewport().setCursor(view.handle_cursor(handle))
-            elif scene.topmost_item_at(pos) is not None:
+            elif scene.topmost_item_at(pos, interior=True) is not None:
                 view.viewport().setCursor(Qt.CursorShape.OpenHandCursor)
             else:
                 view.viewport().setCursor(self.cursor)
@@ -138,37 +136,22 @@ class SelectorTool(BaseTool):
         super().deactivate(view)
 
     def mouseDoubleClickEvent(self, event, view) -> None:
-        """双击文字对象 -> 用文字对话框编辑内容与排版（可撤销）。"""
-        scene = view.scene()
-        item = scene.topmost_item_at(self.scene_pos(event, view))
-        if isinstance(item, TextItem):
-            current = TextFormat.from_item(item)
-            result = TextDialog.ask(view.window(), "编辑文字", item.toPlainText(),
-                                    current, self.settings)
-            if result:
-                if isinstance(result, tuple):
-                    new_text, new_format = result
-                else:                       # 兼容只返回字符串的实现
-                    new_text, new_format = result, current
-                stack = self.undo_stack(view)
-                command = TextFormatCommand(item, new_text, new_format)
-                if stack is not None:
-                    stack.push(command)
-                else:
-                    command.redo()
-                self._remember_format(new_format)
-            event.accept()
-            return
-        event.accept()
+        """双击文字框 / 图形 → 打开右侧参数侧边栏输入文字。
 
-    def _remember_format(self, fmt: TextFormat) -> None:
-        """编辑文字后把排版记为默认，下次输入文字沿用。"""
-        if self.settings is None:
-            return
-        try:
-            self.settings.set_text_format(fmt)
-        except Exception:  # noqa: BLE001
-            pass
+        v1.3.0 起文字参数（内容、字体、字号、颜色、换行）都在侧边栏里，
+        不再弹模态对话框 —— 边看画布边改才看得到效果。
+
+        判定用 ``interior=True``：图形默认不填充，只按描边判定的话
+        "双击图形中间"根本进不去。
+        """
+        scene = view.scene()
+        item = scene.topmost_item_at(self.scene_pos(event, view), interior=True)
+        handler = getattr(view.window(), "focus_text_input", None)
+        if item is not None and callable(handler):
+            # 文字框本体、以及带内部文字的图形（有 raw_label）都能双击进去改字
+            if isinstance(item, TextItem) or getattr(item, "raw_label", None) is not None:
+                handler(item)
+        event.accept()
 
     def mouseHoverEvent(self, event, view) -> None:
         view.viewport().setCursor(self.cursor)
@@ -243,12 +226,17 @@ class SelectorTool(BaseTool):
         item = self._resize_item
         if item is None or item.scene() is None:
             return
-        # 默认：四角等比、四边自由拉伸；按住 Shift 则强制等比
+        # 默认比例由图形项自己决定（字体框默认自由拉伸、图片与形状四角等比），
+        # 按住 Shift 一律强制等比。
         keep_aspect = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
         if not keep_aspect:
-            from canvas.resize import CORNER_HANDLES
+            default = getattr(item, "default_keep_aspect", None)
+            if callable(default):
+                keep_aspect = bool(default(self._resize_handle))
+            else:
+                from canvas.resize import CORNER_HANDLES
 
-            keep_aspect = self._resize_handle in CORNER_HANDLES
+                keep_aspect = self._resize_handle in CORNER_HANDLES
         item.resize_with(self._resize_handle, scene_pos, keep_aspect)
         if view is not None:
             # 手柄跟着新尺寸走，旧位置必须立刻重绘掉

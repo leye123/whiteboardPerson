@@ -45,6 +45,7 @@ from canvas.items import (  # noqa: E402
     StrokeItem,
     TextItem,
     default_radius,
+    make_label,
 )
 from main_window import MainWindow  # noqa: E402
 
@@ -88,7 +89,11 @@ def _add_sample_content(win: MainWindow) -> None:
 
     # 圆角矩形（圆角半径随尺寸自动算）/ 椭圆 / 五角星
     rounded = box(0.06, 0.50, 0.20, 0.24)
-    scene.addItem(RectItem(rounded, warm, 2.5, radius=default_radius(rounded)))
+    rounded_item = RectItem(rounded, warm, 2.5, radius=default_radius(rounded))
+    # 图形内部也能写字，字体数据跟着图形一起保存（v1.3.0）
+    rounded_item.set_raw_label(make_label("图形内的文字", pixel_size=20,
+                                          color=warm, align="center"))
+    scene.addItem(rounded_item)
     scene.addItem(EllipseItem(box(0.30, 0.50, 0.18, 0.24), green, 2.5))
     scene.addItem(PolygonShapeItem("star", box(0.52, 0.47, 0.16, 0.28), orange, 2.5))
 
@@ -103,11 +108,17 @@ def _add_sample_content(win: MainWindow) -> None:
     scene.addItem(title)
 
     # 自动换行的说明文字（折行宽度是排版参数之一）
-    note = TextItem("画笔 · 橡皮（擦断）· 11 种形状 · 文字（可导入字体）\n"
-                    "选择/框选 · 拖动画布 · 多页面 · 撤销重做 · PNG 导出",
+    note = TextItem("画笔 · 橡皮（擦断）· 11 种形状 · 字体框（双击输入）· 图形内文字\n"
+                    "选择/框选 · 参数侧边栏 · 拖动画布 · 多页面 · 撤销重做 · PNG 导出",
                     note_color, 18, wrap=True, text_width=width * 0.5)
     note.setPos(point(0.06, 0.80))
     scene.addItem(note)
+
+    # 字体框：拖出框 → 双击后在右侧参数侧边栏输入（v1.3.0 的输入方式）
+    boxed = TextItem("字体框：拖出大小，双击输入", note_color, 18, wrap=True,
+                     text_width=width * 0.26, box_height=height * 0.12)
+    boxed.setPos(point(0.62, 0.12))
+    scene.addItem(boxed)
 
 
 def main() -> int:

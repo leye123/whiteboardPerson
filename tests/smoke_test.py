@@ -21,7 +21,7 @@ for _stream in (sys.stdout, sys.stderr):
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QEvent, QPoint, QPointF, QRect, Qt
-from PySide6.QtGui import QColor, QImage, QMouseEvent, QPainter
+from PySide6.QtGui import QColor, QImage, QMouseEvent, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -68,8 +68,21 @@ QFileDialog.getSaveFileName = staticmethod(lambda *a, **k: ("", ""))
 
 from main_window import MainWindow  # noqa: E402
 from canvas.items import StrokeItem  # noqa: E402
-from tools.text_tool import TextEditDialog  # noqa: E402
-TextEditDialog.ask = staticmethod(lambda *a, **k: "测试文字")
+from core.stroke import qcolor_from_rgba  # noqa: E402
+from canvas.items import (  # noqa: E402
+    EllipseItem,
+    GroupItem,
+    ImageItem,
+    LineItem,
+    PolygonShapeItem,
+    RectItem,
+    TextItem,
+)
+from core.page import BoardPage  # noqa: E402
+from core.settings import DEFAULT_THICKNESS, DEFAULT_TOOL  # noqa: E402
+from persistence import file_handler as fh  # noqa: E402
+from persistence import file_handler as fh_module  # noqa: E402
+from persistence import serializer  # noqa: E402
 
 
 def page_counts(win):
@@ -209,11 +222,23 @@ def main() -> int:
        and restored[0].point_count() == points_before,
        "拖拽擦除可整体撤销（原始笔画与点数完整恢复）")
 
-    # ---- 5. 文字（mock 对话框）
+    # ---- 5. 字体框：拖出框大小，文字在侧边栏里输入
     win.set_active_tool("text")
-    click(vp, QPoint(600, 400))
+    drag(vp, QPoint(560, 360), [QPoint(700, 400), QPoint(820, 440)])
     app.processEvents()
-    ok(page_counts(win) == [3], "文字对象插入")
+    ok(page_counts(win) == [3], "拖拽创建了字体框")
+    box_item = [it for it in win.view.scene().items() if isinstance(it, TextItem)][0]
+    ok(box_item.is_box(), "创建出来的是「字体框」（有固定框尺寸）")
+    ok(box_item.is_empty(), "刚建好的框是空的，等待双击输入")
+    ok(abs(box_item.text_width() - 260.0) < 12.0,
+       f"框宽跟随拖拽距离（{box_item.text_width():.0f}）")
+    ok(box_item.isSelected(), "新建的字体框自动选中，右侧参数栏直接可调")
+    # 侧边栏输入文字（相当于双击后输入）
+    win.property_panel.text_edit.setPlainText("测试文字")
+    win._commit_style_changes()
+    app.processEvents()
+    ok(box_item.toPlainText() == "测试文字", "侧边栏输入的内容实时写进字体框")
+    ok(win.undo_stack.undoText() == "修改参数", "输入文字进撤销栈")
 
     # ---- 6. 选择 + 拖动（带撤销）
     win.set_active_tool("selector")
@@ -354,8 +379,6 @@ def main() -> int:
 
     # ---- 8. 序列化 round-trip + .wbd 文件
     import json
-    from persistence import file_handler as fh
-    from persistence import serializer
     doc = serializer.document_to_dict(win.pages, win.page_index)
     text = serializer.serialize_document(win.pages, win.page_index)
     pages2, cur2 = serializer.deserialize_document(text)
@@ -403,7 +426,6 @@ def main() -> int:
     ok(True, "深浅主题切换正常")
 
     # ---- 11b. 恢复默认设置
-    from core.settings import DEFAULT_THICKNESS, DEFAULT_TOOL
     win.settings.set_thickness(33.0)
     win.settings.set_current_tool("eraser")
     win.reset_settings()
@@ -421,7 +443,6 @@ def main() -> int:
     # 曾经因为 painter.scale(factor) 与 scene.render(target=整图) 双重缩放，
     # 只导出了左上角那一块（表现为「导出图片被裁掉一半」）。
     from PySide6.QtCore import QRectF
-    from canvas.items import RectItem
 
     export_scene = win.view.scene()
     export_scene.addItem(RectItem(QRectF(0.0, 0.0, 200.0, 100.0), QColor(0, 0, 0), 2.0))
@@ -458,15 +479,6 @@ def main() -> int:
     # ------------------------------------------------------------------
     # 以下为「形状种类 / 虚线 / 文字排版 / 导入图片」的回归检查
     # ------------------------------------------------------------------
-    from canvas.items import (
-        EllipseItem,
-        ImageItem,
-        LineItem,
-        PolygonShapeItem,
-        TextItem,
-    )
-    from core.text_format import TextFormat
-    from widgets.text_dialog import TextDialog
 
     def fresh_scene():
         """清空当前页并让撤销栈变干净。
@@ -503,17 +515,125 @@ def main() -> int:
     kinds = sorted(it.kind() for it in shapes if isinstance(it, PolygonShapeItem))
     ok(kinds == ["diamond", "star", "triangle"], f"多边形种类正确：{kinds}")
 
-    # 橡皮擦对多边形/文字/图片是整体删除（以前这三类根本擦不掉）
+    # ---- 14b. 橡皮擦只擦手绘笔迹：图形 / 线段 / 字体框 / 图片一概不碰
+    # （v1.3.0：以前橡皮碰到这些对象会**整块删掉**，用户只想擦一点线条，
+    #   旁边的图形就整个消失，非常容易误删）
     win.set_active_tool("eraser")
     before = page_counts(win)[0]
+    steps_before = win.undo_stack.index()
     star = [it for it in scene.items()
             if isinstance(it, PolygonShapeItem) and it.kind() == "star"][0]
-    # 命中判定用的是「描边路径」（未填充图形点中间不算命中），
-    # 所以取路径上的点而不是外接矩形中心。
     hit = star.path().pointAtPercent(0.05) + star.scenePos()
-    click(vp, win.view.mapFromScene(hit))
+    click(vp, win.view.mapFromScene(hit))          # 精确点在星形描边上
     app.processEvents()
-    ok(page_counts(win)[0] == before - 1, "橡皮擦能把五角星整体擦掉")
+    ok(page_counts(win)[0] == before and star.scene() is scene,
+       "橡皮擦不碰图形（点在五角星描边上也删不掉它）")
+    ok(win.undo_stack.index() == steps_before,
+       "橡皮擦碰到图形时不会产生空的撤销步骤")
+
+    # 顺手在这个场景里放上字体框 / 图片 / 线段，一起验证橡皮都不碰
+    area = win.view.mapToScene(vp.rect()).boundingRect()
+    box_item = TextItem("橡皮别碰我", QColor(0, 0, 0), 24)
+    box_item.set_box_size(200.0, 90.0)
+    box_item.setPos(area.left() + 40.0, area.top() + 40.0)
+    scene.addItem(box_item)
+    image_path = os.path.join(_tmp, "eraser_sample.png")
+    sample = QImage(60, 40, QImage.Format.Format_ARGB32)
+    sample.fill(QColor("#1a4fb4"))
+    sample.save(image_path)
+    image_item = ImageItem(QPixmap(image_path))
+    image_item.setPos(area.left() + 300.0, area.top() + 40.0)
+    scene.addItem(image_item)
+    line_item = LineItem(QPointF(area.left() + 40.0, area.top() + 200.0),
+                         QPointF(area.left() + 240.0, area.top() + 200.0),
+                         QColor(0, 0, 0), 3.0)
+    scene.addItem(line_item)
+    app.processEvents()
+
+    before = page_counts(win)[0]
+    for item in (box_item, image_item, line_item):
+        centre = win.view.mapFromScene(item.sceneBoundingRect().center())
+        click(vp, centre)
+        app.processEvents()
+    ok(page_counts(win)[0] == before,
+       f"橡皮擦不碰字体框/图片/线段（{before} 个对象一个没少）")
+    ok(box_item.scene() is scene and image_item.scene() is scene
+       and line_item.scene() is scene, "这三类对象仍然都在场景里")
+
+    # 橡皮擦该干的活照旧：手绘笔迹照样能擦断
+    win.set_active_tool("pen")
+    drag(vp, QPoint(200, 620), [QPoint(300, 640), QPoint(400, 650),
+                                QPoint(500, 655), QPoint(600, 660)])
+    app.processEvents()
+    ink = [it for it in scene.items() if isinstance(it, StrokeItem)]
+    ok(len(ink) == 1, "先画一条笔迹备用")
+    ink_points = ink[0].points()
+    mid = ink[0].mapToScene(ink_points[len(ink_points) // 2])
+    win.set_active_tool("eraser")
+    click(vp, win.view.mapFromScene(mid))
+    app.processEvents()
+    fragments = [it for it in scene.items() if isinstance(it, StrokeItem)]
+    ok(len(fragments) == 2 and all(it.isSelected() is False for it in fragments),
+       f"橡皮擦仍然能把笔迹擦断（1 -> {len(fragments)} 段）")
+    ok(page_counts(win)[0] == before + 1 + 1,
+       "擦断后对象数 = 原对象 + 两段笔迹（其余对象都没被动过）")
+
+    # ---- 14c. 工具栏「形状」下拉按钮：用形状时高亮（和其它工具按钮一致）
+    win.set_active_tool("pen")
+    app.processEvents()
+    ok(win.shape_button.isCheckable() and not win.shape_button.isChecked(),
+       "用画笔时形状按钮不高亮")
+    for kind in ("rect", "diamond", "dashed_arrow"):
+        win.set_active_tool(kind)
+        app.processEvents()
+        ok(win.shape_button.isChecked(),
+           f"用「{kind}」时形状按钮高亮（和工具栏其它工具按钮一样）")
+    win.set_active_tool("text")
+    app.processEvents()
+    ok(not win.shape_button.isChecked() and win.tool_actions["text"].isChecked(),
+       "换回文字工具后高亮回到文字按钮上")
+    win.set_active_tool("rect")
+    app.processEvents()
+    ok(win.shape_button.isChecked()
+       and not win.tool_actions["text"].isChecked(),
+       "再选回形状时高亮又回到形状按钮上")
+
+    # 光 isChecked 为真还不够：按钮得**真的画出**选中底色（像素级，与主题无关）
+    def highlight_count(button, reference=None):
+        """按钮矩形里出现的颜色统计；给参考色时返回该颜色的像素数。
+
+        参考色从「画笔按钮选中时的底色」里取，所以深浅主题都适用。
+        """
+        shot = win.grab().toImage()
+        origin = button.mapTo(win, QPoint(0, 0))
+        box = QRect(origin, button.size())
+        counts = {}
+        for y in range(box.top(), box.bottom() + 1):
+            for x in range(box.left(), box.right() + 1):
+                if not (0 <= x < shot.width() and 0 <= y < shot.height()):
+                    continue
+                name = shot.pixelColor(x, y).name()
+                counts[name] = counts.get(name, 0) + 1
+        if reference is None:
+            top = max(counts, key=counts.get) if counts else None
+            return counts, top
+        return counts.get(reference, 0), reference
+
+    bar = win.shape_button.parentWidget()
+    pen_button = bar.widgetForAction(win.tool_actions["pen"])
+    win.set_active_tool("pen")
+    app.processEvents()
+    pen_counts, highlight = highlight_count(pen_button)
+    ok(highlight is not None and pen_counts.get(highlight, 0) > 100,
+       f"画笔按钮选中时确实有底色（{highlight}，{pen_counts.get(highlight, 0)} 像素）")
+    idle, _ = highlight_count(win.shape_button, highlight)
+    ok(idle == 0, "用画笔时形状按钮完全没有高亮底色")
+    win.set_active_tool("rect")
+    app.processEvents()
+    lit, _ = highlight_count(win.shape_button, highlight)
+    pen_idle, _ = highlight_count(pen_button, highlight)
+    ok(lit > 100, f"用矩形时形状按钮画出了同一套高亮底色（{lit} 像素）")
+    ok(pen_idle == 0, "用矩形时画笔按钮的高亮底色已经消失")
 
     # ---- 15. 线段：直线 / 虚线 / 箭头 / 虚线箭头 / 双向箭头
     scene = fresh_scene()
@@ -574,44 +694,125 @@ def main() -> int:
        f"擦断后的笔迹碎片保持虚线（{len(fragments)} 段）")
     win.line_style_picker.set_current("solid")
 
-    # ---- 16. 文字：字体 / 字号 / 颜色 / 粗斜体 / 自动换行 + 双击编辑
+    # ---- 16b. 空字体框的占位虚线框：画在视口叠加层，不进 .wbd / 不进导出的 PNG
     scene = fresh_scene()
-    sample = TextFormat(family="Consolas", pixel_size=28, color=QColor("#c0392b"),
-                        bold=True, wrap=True, text_width=180, align="center")
-    TextDialog.ask = staticmethod(lambda *a, **k: ("自动换行\n的文字", sample))
+    app.processEvents()
+    base_shot = win.view.viewport().grab().toImage()      # 没有字体框时的画布
     win.set_active_tool("text")
-    click(vp, QPoint(420, 300))
+    drag(vp, QPoint(320, 260), [QPoint(430, 300), QPoint(560, 340)])
+    app.processEvents()
+    empty_box = [it for it in scene.items() if isinstance(it, TextItem)][0]
+    win.set_active_tool("selector")
+    scene.clearSelection()
+    app.processEvents()
+    ok(empty_box.is_box() and empty_box.is_empty(), "新建的字体框是空的且是「框」形态")
+
+    box_view = win.view.mapFromScene(empty_box.resize_rect()).boundingRect()
+    shot = win.view.viewport().grab().toImage()
+
+    def _differs(x, y) -> bool:
+        """两次渲染的同一像素是否不同（用来单独挑出占位框画了什么）。"""
+        if not (0 <= x < shot.width() and 0 <= y < shot.height()):
+            return False
+        before, after = base_shot.pixelColor(x, y), shot.pixelColor(x, y)
+        return (abs(before.red() - after.red()) > 8
+                or abs(before.green() - after.green()) > 8
+                or abs(before.blue() - after.blue()) > 8)
+
+    frame_hits = 0
+    for x in range(box_view.left(), box_view.right() + 1):
+        for y in range(box_view.top() - 3, box_view.top() + 4):
+            frame_hits += 1 if _differs(x, y) else 0
+        for y in range(box_view.bottom() - 3, box_view.bottom() + 4):
+            frame_hits += 1 if _differs(x, y) else 0
+    ok(frame_hits >= 20, f"空字体框画出了虚线占位框（识别到 {frame_hits} 个虚线段像素）")
+    gaps = sum(1 for x in range(box_view.left(), box_view.right() + 1)
+               if not _differs(x, box_view.top()))
+    ok(gaps > 0, f"占位框是虚线（上边有 {gaps} 个空白缺口）")
+
+    center = box_view.center()
+    inner_hits = 0
+    for x in range(center.x() - 20, center.x() + 21):
+        for y in range(center.y() - 12, center.y() + 13):
+            inner_hits += 1 if _differs(x, y) else 0
+    ok(inner_hits == 0, "占位框只画边框，框内是干净的（不会挡住后面的内容）")
+
+    # 占位框是"叠加层"：导出 PNG 里一点痕迹都不该有
+    png_empty = os.path.join(_tmp, "empty_box.png")
+    QFileDialog.getSaveFileName = staticmethod(lambda *a, **k: (png_empty, ""))
+    win.export_png()
+    empty_image = QImage(png_empty)
+    png_background = empty_image.pixelColor(2, 2)
+    stray = 0
+    for y in range(0, empty_image.height(), 2):
+        for x in range(0, empty_image.width(), 2):
+            color = empty_image.pixelColor(x, y)
+            if (abs(color.red() - png_background.red()) > 24
+                    or abs(color.green() - png_background.green()) > 24
+                    or abs(color.blue() - png_background.blue()) > 24):
+                stray += 1
+    ok(stray == 0, f"空字体框的占位框不会被导出到 PNG（杂质像素 {stray}）")
+    ok(all(it.to_dict()["type"] != "rect" for it in scene.items()),
+       "占位框不是场景里的图形项（不会进 .wbd）")
+
+    # ---- 16c. 侧边栏改文字参数：字体 / 字号 / 颜色 / 粗斜体 / 对齐 + 双击进输入
+    scene = fresh_scene()
+    win.set_active_tool("text")
+    drag(vp, QPoint(300, 240), [QPoint(420, 280), QPoint(540, 320)])
     app.processEvents()
     texts = [it for it in scene.items() if isinstance(it, TextItem)]
-    ok(len(texts) == 1, "文字对象插入")
+    ok(len(texts) == 1 and texts[0].is_box(), "文字工具拖出的是字体框")
     text_item = texts[0]
+    panel = win.property_panel
+    ok(panel.isVisible(), "选中字体框后参数侧边栏自动出现")
+    ok(not panel.text_group.isHidden() and panel.outline_group.isHidden(),
+       "字体框只显示「文字参数」")
+
+    # 双击 -> 光标进内容框（"双击才输入文字"）
+    win.set_active_tool("selector")
+    scene.clearSelection()
+    win.property_panel.hide()
+    inside = win.view.mapFromScene(text_item.scenePos() + QPointF(40, 20))
+    double_click(vp, inside)
+    app.processEvents()
+    ok(panel.isVisible() and panel.text_edit.hasFocus(),
+       "双击字体框后参数栏弹出且内容框获得焦点")
+    ok(text_item.isSelected(), "双击后该字体框被选中")
+
+    # 在侧边栏里改参数：每改一项都实时落到图形项上
+    panel.text_edit.setPlainText("自动换行\n的文字")
+    panel.size_spin.setValue(28)
+    panel.bold_button.setChecked(True)
+    panel.color_button.set_color(QColor("#c0392b"))
+    panel.align_combo.setCurrentIndex(panel.align_combo.findData("center"))
+    app.processEvents()
+    ok(text_item.toPlainText() == "自动换行\n的文字", "内容实时写进字体框")
     ok(text_item.font().pixelSize() == 28 and text_item.font().bold(),
-       "字号与粗体按对话框参数生效")
-    ok(text_item.font().family() == "Consolas", "字体族按对话框参数生效")
-    ok(text_item.is_wrapped() and abs(text_item.text_width() - 180) < 0.01,
-       "自动换行与折行宽度按参数生效")
-    ok(text_item.defaultTextColor().name() == "#c0392b", "文字颜色按参数生效")
-    ok(text_item.text_align() == "center", "对齐方式按参数生效")
+       "字号与粗体实时生效")
+    ok(text_item.defaultTextColor().name() == "#c0392b", "颜色实时生效")
+    ok(text_item.text_align() == "center", "对齐实时生效")
     clone = TextItem.from_dict(text_item.to_dict())
     ok(clone.to_dict() == text_item.to_dict(),
-       "文字排版可无损序列化（字体/字号/颜色/换行/对齐）")
+       "文字排版可无损序列化（内容/字体/字号/颜色/对齐/框尺寸）")
 
-    edited = TextFormat(pixel_size=12, color=QColor("#1a4fb4"), wrap=False)
-    TextDialog.ask = staticmethod(lambda *a, **k: ("改过的文字", edited))
-    win.set_active_tool("selector")
-    screen_pos = win.view.mapFromScene(text_item.scenePos() + QPointF(30, 12))
-    double_click(vp, screen_pos)
-    app.processEvents()
-    ok(text_item.toPlainText() == "改过的文字"
-       and text_item.font().pixelSize() == 12
-       and not text_item.is_wrapped(),
-       "双击文字可编辑内容与排版")
+    # 连续调节只压成一条撤销命令（否则拖滑块会塞满撤销栈）
+    steps_before = win.undo_stack.index()
+    win._commit_style_changes()
+    ok(win.undo_stack.index() == steps_before + 1, "一串参数改动 = 一个撤销步骤")
     win.undo_stack.undo()
     app.processEvents()
-    ok(text_item.toPlainText() == "自动换行\n的文字"
-       and text_item.font().pixelSize() == 28
-       and text_item.is_wrapped(),
-       "文字编辑可撤销（内容与排版一起回退）")
+    ok(text_item.toPlainText() == "" and text_item.font().pixelSize() != 28,
+       "参数改动可整体撤销（内容与排版一起回退）")
+    win.undo_stack.redo()
+    app.processEvents()
+    ok(text_item.toPlainText() == "自动换行\n的文字", "重做恢复参数改动")
+
+    # 工具栏改颜色 / 粗细也会作用到选中对象（和侧边栏一致）
+    win.color_picker.set_color(QColor("#1a4fb4"))
+    app.processEvents()
+    win._commit_style_changes()
+    ok(text_item.defaultTextColor().name() == "#1a4fb4",
+       "工具栏颜色也作用到选中对象")
 
     # ---- 17. 导入图片（回归：mapToScene(QPointF) 曾抛 TypeError，表现为“点了没反应”）
     scene = fresh_scene()
@@ -671,29 +872,38 @@ def main() -> int:
     ok(abs(image.resize_rect().width() - rect_before.width()) < 0.5,
        "图片缩放可撤销")
 
-    # ---- 18b. 文字可自由伸缩（拖手柄改字号 + 撤销）
+    # ---- 18b. 字体框自由拉伸：改的是框，不是字号（默认不等比）
     scene = fresh_scene()
-    TextDialog.ask = staticmethod(
-        lambda *a, **k: ("可缩放的文字内容", TextFormat(pixel_size=20)))
     win.set_active_tool("text")
-    click(vp, QPoint(400, 300))
+    win.property_panel.size_spin.setValue(20)
+    drag(vp, QPoint(360, 260), [QPoint(440, 300), QPoint(520, 340)])
     app.processEvents()
     text_item = [it for it in scene.items() if isinstance(it, TextItem)][0]
     win.set_active_tool("selector")
     scene.clearSelection()
     text_item.setSelected(True)
     app.processEvents()
-    ok(win.view.resize_target() is text_item, "选中文字后出现缩放手柄")
-    size_before = text_item.font().pixelSize()
+    ok(win.view.resize_target() is text_item, "选中字体框后出现缩放手柄")
+    font_before = text_item.font().pixelSize()
+    box_before = text_item.resize_rect()
+    ok(box_before.width() > 100 and box_before.height() > 40,
+       f"字体框有明确尺寸（{box_before.width():.0f}x{box_before.height():.0f}）")
     corner = win.view.handle_points_view()[4]
     drag(vp, QPoint(int(corner.x()), int(corner.y())),
-         [QPoint(int(corner.x()) + 60, int(corner.y()) + 30)])
+         [QPoint(int(corner.x()) + 120, int(corner.y()) + 40)])
     app.processEvents()
-    ok(text_item.font().pixelSize() > size_before,
-       f"拖手柄把字号放大（{size_before} -> {text_item.font().pixelSize()}）")
+    box_after = text_item.resize_rect()
+    ok(box_after.width() > box_before.width() + 80,
+       f"拖右下手柄把框拉宽（{box_before.width():.0f} -> {box_after.width():.0f}）")
+    ok(text_item.font().pixelSize() == font_before,
+       "拉框不改字号（字体框默认非等比缩放）")
+    ok(box_after.height() / max(box_after.width(), 1e-6)
+       != box_before.height() / max(box_before.width(), 1e-6),
+       "宽高不再保持原比例（自由拉伸）")
     win.undo_stack.undo()
     app.processEvents()
-    ok(text_item.font().pixelSize() == size_before, "文字缩放可撤销")
+    ok(abs(text_item.resize_rect().width() - box_before.width()) < 0.5,
+       "字体框拉伸可撤销")
 
     # ---- 18c. 形状/笔迹/文字/图片都能自由伸缩（拖手柄）
     def drag_handle(item, handle_index, delta: QPoint):
@@ -839,8 +1049,6 @@ def main() -> int:
     ok(dropped_items[0].isSelected(), "拖入的图片自动选中，可以直接拖动/缩放")
 
     # .wbd 拖进窗口 = 追加为新页面（不是替换当前文档）
-    from core.page import BoardPage
-    from persistence import file_handler as fh_module
 
     source_doc = os.path.join(_tmp, "dragged_doc.wbd")
     source_pages = [BoardPage("来源页 1"), BoardPage("来源页 2")]
@@ -891,8 +1099,6 @@ def main() -> int:
        "视口路径把图片导入当前页")
 
     # ---- 20. 组合（Ctrl+G）：整体选中 / 移动 / 自由缩放 / 存读 / 拆开
-    from canvas.items import GroupItem, PolygonShapeItem
-    from persistence import serializer
 
     scene = fresh_scene()
     win.set_active_tool("rect")
@@ -1028,6 +1234,129 @@ def main() -> int:
         win.pages, win.page_index = saved_pages, saved_index
     ok(failure is None and fallback is not None,
        f"页面为空/越界时撤销栈不抛异常（{failure!r}）")
+
+    # ---- 22. 图形内部写文字（含字体数据），在参数窗口里查看与修改
+    scene = fresh_scene()
+    win.set_active_tool("rect")
+    drag(vp, QPoint(300, 240), [QPoint(460, 300), QPoint(620, 380)])
+    app.processEvents()
+    win.set_active_tool("selector")
+    shape = [it for it in scene.items() if isinstance(it, RectItem)][0]
+    scene.clearSelection()
+    shape.setSelected(True)
+    app.processEvents()
+    panel = win.property_panel
+    ok(panel.title_label.text().startswith("图形"), "选中图形后侧边栏显示「图形」")
+    ok(not panel.text_group.isHidden(), "图形也能看到「文字参数」（写内部文字）")
+    ok(panel.text_edit.toPlainText() == "", "还没有内部文字时内容框是空的")
+
+    panel.text_edit.setPlainText("图形里的标题")
+    panel.size_spin.setValue(24)
+    panel.bold_button.setChecked(True)
+    panel.text_color_button.set_color(QColor("#00695c"))
+    panel.align_combo.setCurrentIndex(panel.align_combo.findData("center"))
+    app.processEvents()
+    win._commit_style_changes()
+    ok(shape.label_text() == "图形里的标题", "文字写进了图形内部")
+    label = shape.raw_label()
+    ok(label["pixel_size"] == 24 and label["bold"] is True
+       and qcolor_from_rgba(label["color"]).name() == "#00695c"
+       and label["align"] == "center",
+       "字体数据（字号/粗体/颜色/对齐）一起存进图形")
+
+    # 重新选中时参数窗口要把这些值显示出来（"可以在参数窗口中查看"）
+    scene.clearSelection()
+    app.processEvents()
+    ok(panel.text_edit.toPlainText() == "", "取消选中后内容框清空")
+    shape.setSelected(True)
+    app.processEvents()
+    ok(panel.text_edit.toPlainText() == "图形里的标题"
+       and panel.size_spin.value() == 24
+       and panel.bold_button.isChecked()
+       and panel.align_combo.currentData() == "center",
+       "重新选中图形时参数窗口回显内部文字与字体设置")
+
+    # 双击图形 -> 参数栏聚焦到内容框（方便直接改字）
+    win.set_active_tool("selector")
+    inside = win.view.mapFromScene(shape.sceneBoundingRect().center())
+    double_click(vp, inside)
+    app.processEvents()
+    ok(panel.text_edit.hasFocus(), "双击图形后内容框获得焦点")
+
+    # v1.3.0：图形默认不填充，"点图形中间"也要能选中/拖动它
+    scene.clearSelection()
+    app.processEvents()
+    click(vp, inside)
+    app.processEvents()
+    ok(shape.isSelected(), "鼠标点图形中间就能选中它")
+    count_before = page_counts(win)[0]
+    moved = shape.pos()
+    drag(vp, inside, [QPoint(inside.x() + 20, inside.y() + 12),
+                      QPoint(inside.x() + 40, inside.y() + 24)])
+    app.processEvents()
+    ok(shape.pos() != moved, "按住图形中间可以拖动它（位移 %s）"
+       % (shape.pos() - moved,))
+
+    # 橡皮擦仍按描边判定：点图形中间不会误删整个图形
+    win.set_active_tool("eraser")
+    click(vp, win.view.mapFromScene(shape.sceneBoundingRect().center()))
+    app.processEvents()
+    ok(page_counts(win)[0] == count_before, "橡皮擦点图形中间不会误删整个图形")
+    win.set_active_tool("selector")
+    shape.setSelected(True)
+    app.processEvents()
+
+    # ---- 22b. 侧边栏改图形参数（颜色/线宽/线型/填充）即时生效 + 一个撤销步骤
+    ok(not panel.outline_group.isHidden() and panel.title_label.text().startswith("图形"),
+       "选中图形后侧边栏显示「图形参数」")
+    shape.set_fill_color(None)
+    win._refresh_property_panel()
+    app.processEvents()
+    ok(panel.color_button.color().name() == shape.pen().color().name()
+       and panel.width_slider.value() == int(round(shape.pen().widthF())),
+       "侧边栏回显了图形当前的描边颜色与线宽")
+    ok(not panel.fill_check.isChecked() and not panel.fill_button.isEnabled(),
+       "没有填充时「填充」开关是关的、颜色按钮不可点")
+
+    steps = win.undo_stack.index()
+    panel.color_button.set_color(QColor("#8e44ad"))
+    panel.width_slider.setValue(6)
+    panel.style_combo.setCurrentIndex(panel.style_combo.findData("dot"))
+    app.processEvents()
+    ok(shape.pen().color().name() == "#8e44ad", "侧边栏改颜色实时落到图形上")
+    ok(abs(shape.pen().widthF() - 6.0) < 0.01, "侧边栏改线宽实时落到图形上")
+    ok(shape.current_line_style() == "dot", "侧边栏改线型实时落到图形上")
+    win._commit_style_changes()
+    ok(win.undo_stack.index() == steps + 1, "图形参数串改也只占一个撤销步骤")
+    win.undo_stack.undo()
+    app.processEvents()
+    ok(shape.pen().color().name() != "#8e44ad"
+       and shape.current_line_style() != "dot",
+       "图形参数改动可以整体撤销")
+
+    # 填充：勾上 -> 有填充色；取消勾选 -> 回到无填充（None 不能被过滤掉）
+    panel.fill_check.setChecked(True)
+    app.processEvents()
+    ok(shape.fill_color() is not None, "勾选「填充」后图形有了填充色")
+    panel.fill_button.set_color(QColor("#fff3cd"))
+    app.processEvents()
+    win._commit_style_changes()
+    ok(shape.fill_color() is not None
+       and shape.fill_color().name() == "#fff3cd", "填充颜色实时生效")
+    panel.fill_check.setChecked(False)
+    app.processEvents()
+    win._commit_style_changes()
+    ok(shape.fill_color() is None, "取消「填充」真的取消了（None 没被过滤掉）")
+
+    # 图形与标签一起存进 .wbd
+    from persistence import serializer as serializer_mod
+    doc = serializer_mod.document_to_dict(win.pages, win.page_index)
+    pages2, cur2 = serializer_mod.document_from_dict(doc)
+    reloaded = [it for it in pages2[cur2].scene.items() if isinstance(it, RectItem)]
+    ok(len(reloaded) == 1 and reloaded[0].label_text() == "图形里的标题",
+       "图形的内部文字能完整保存/读取")
+    ok(reloaded[0].raw_label()["pixel_size"] == 24,
+       "读回来的字体数据一致")
 
     print(f"\n全部 {checks} 项冒烟检查通过")
     return 0

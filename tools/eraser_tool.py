@@ -7,7 +7,11 @@
 * 擦两端 → 笔画被缩短；
 * 全都擦到 → 整条消失。
 
-矩形/椭圆/直线/箭头/文字/图片无法「擦断」，被橡皮碰到时整体删除。
+**橡皮擦只处理手绘笔迹（``StrokeItem``）**：矩形/椭圆/多边形/直线箭头/字体框/
+图片/组合它一概不碰（v1.3.0 起）。原因是「橡皮」的语义就是擦掉画上去的线条，
+以前碰到图形/文字/图片会**整块删掉** —— 用户只想擦掉一点手绘线，结果旁边的
+图形整个消失，非常容易误删。要删图形请用选择工具选中后按 ``Delete``
+（或在参数侧边栏里改参数）；组合里的笔迹不单独编辑，先 ``Ctrl+Shift+G`` 拆开。
 
 一次「按下 → 拖拽 → 抬起」只产生**一个**撤销步骤
 （通过 :class:`core.history.ReplaceItemsCommand` 把整段手势的增删合并起来），
@@ -19,25 +23,11 @@ from __future__ import annotations
 
 from PySide6.QtCore import QPointF, Qt
 
-from canvas.items import (
-    EllipseItem,
-    GroupItem,
-    ImageItem,
-    LineItem,
-    PolygonShapeItem,
-    RectItem,
-    StrokeItem,
-    TextItem,
-    is_preview,
-    line_style_name,
-)
+from canvas.items import StrokeItem, is_preview
 from core.history import ReplaceItemsCommand
 from core.stroke import cumulative_lengths, split_by_eraser
 from tools.base_tool import BaseTool
 
-# 无法擦断、只能整体删除的图形（形状/文字/图片/组合都属此类）
-_WHOLE_ERASE = (LineItem, RectItem, EllipseItem, PolygonShapeItem, TextItem,
-                ImageItem, GroupItem)
 # 擦断后少于这个点数的碎片直接丢弃（1 个点只剩个圆点，没有保留价值）
 MIN_SEGMENT_POINTS = 2
 
@@ -107,14 +97,21 @@ class EraserTool(BaseTool):
 
     # ------------------------------------------------------------- 核心逻辑
     def _erase_at(self, pos: QPointF, view) -> None:
+        """只擦笔迹：图形 / 线段 / 字体框 / 图片 / 组合一律不碰。
+
+        ``scene.items_at()`` 只返回**顶层**对象，所以组合里的笔迹不会在这里
+        被单独擦到（组合的成员不能被单独编辑，要改先 Ctrl+Shift+G 拆开）。
+        """
         scene = view.scene()
         radius = self.radius
         for item in scene.items_at(pos, radius):
-            if item.parentItem() is not None or is_preview(item):
-                continue
-            if isinstance(item, StrokeItem) and self.partial:
+            if not isinstance(item, StrokeItem) or is_preview(item):
+                continue        # 不是手绘笔迹（图形/线段/文字框/图片/组合）→ 橡皮不管
+            if item.parentItem() is not None:
+                continue        # 组合里的笔迹：不单独编辑
+            if self.partial:
                 self._split_stroke(item, pos, radius, scene)
-            elif isinstance(item, (StrokeItem,) + _WHOLE_ERASE):
+            else:
                 self._remove(item, scene)
 
     def _split_stroke(self, item: StrokeItem, center: QPointF, radius: float,

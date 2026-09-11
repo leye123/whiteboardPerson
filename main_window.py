@@ -28,7 +28,17 @@ from PySide6.QtWidgets import (
 from shiboken6 import isValid
 
 from canvas.view import WhiteboardView
-from canvas.items import GroupItem, LINE_STYLE_LABELS, ImageItem
+from canvas.items import (
+    GroupItem,
+    LINE_STYLE_LABELS,
+    ImageItem,
+    PolygonShapeItem,
+    RectItem,
+    StrokeItem,
+    TextItem,
+    apply_style_changes,
+    style_targets,
+)
 from core import fonts, paths
 from core.version import APP_TITLE, __version__
 from core.history import (
@@ -36,11 +46,13 @@ from core.history import (
     ClearPageCommand,
     GroupItemsCommand,
     RemoveItemsCommand,
+    StyleStatesCommand,
     UngroupItemsCommand,
     push_commands,
 )
 from core.page import BoardPage
 from core.settings import AppSettings
+from core.stroke import qcolor_from_rgba
 from core.text_format import TextFormat
 from persistence import file_handler as fh
 from tools.eraser_tool import EraserTool
@@ -53,6 +65,7 @@ from widgets import icons
 from widgets.color_picker import ColorPickerButton
 from widgets.line_style_picker import LineStylePicker
 from widgets.page_navigator import PageNavigator
+from widgets.property_panel import PropertyPanel, TargetInfo
 from widgets.thickness_slider import ThicknessSlider
 
 # 非形状工具（选择/拖动/画笔/橡皮/文字）
@@ -79,8 +92,8 @@ TOOL_TIPS = {
     "selector": "选择/移动：点击选中、Ctrl 多选、空白处拖拽框选、双击文字可编辑",
     "pan": "拖动画布：按住左键拖动（也可用空格+左键或中键拖拽）",
     "pen": "画笔：自由手绘（线宽随「粗细」、线型随「线型」）",
-    "eraser": "橡皮擦：擦掉经过的笔迹片段；范围随「粗细」变化",
-    "text": "文字：点击画布输入文字；可设字体、字号、颜色、自动换行，也能导入字体",
+    "eraser": "橡皮擦：只擦手绘笔迹（擦断，不整条删除）；图形/文字框/图片不归它管，选中后按 Delete 删除",
+    "text": "文字：在画布上拖出字体框，再双击它在右侧「参数」里输入文字（可导入字体）",
 }
 
 # 可以把图片拖进窗口导入的扩展名（能不能解码交给 QImageReader 判断）
@@ -126,11 +139,10 @@ class MainWindow(QMainWindow):
         for key, label, factory in TOOL_META:
             if key == "text":
                 tool = TextTool(text_format=self.text_format, settings=self.settings)
-                tool.format_changed = self._on_text_format_changed
             else:
                 tool = factory() if callable(factory) else factory
             tool.color = self.settings.color()
-            # 需要读写设置的工具（文字对话框要用 settings 记住导入的字体）
+            # 需要读写设置的工具（导入字体、记住排版）
             if hasattr(tool, "settings"):
                 tool.settings = self.settings
             self.tools[key] = tool
@@ -159,6 +171,7 @@ class MainWindow(QMainWindow):
         self._create_menus()
         self._create_toolbars()
         self._create_statusbar()
+        self._create_property_panel()
 
         # ---------------------------------------------------------- 设置还原
         geom = self.settings.window_geometry()
@@ -167,6 +180,9 @@ class MainWindow(QMainWindow):
         state = self.settings.window_state()
         if state is not None:
             self.restoreState(state)
+        # 侧边栏的显示状态由 dock 布局还原，菜单勾选要跟着对齐
+        if hasattr(self, "panel_action"):
+            self.panel_action.setChecked(self.property_panel.isVisible())
 
         theme = self.settings.theme()
         self.theme_action.setChecked(theme == "dark")
@@ -275,6 +291,14 @@ class MainWindow(QMainWindow):
         v["zoom_reset"] = self._act("实际大小 100%", "Ctrl+1", self.view.zoom_reset)
         v["reset_settings"] = self._act("恢复默认设置…", None, self.reset_settings)
 
+        # 参数侧边栏的显示开关
+        self.panel_action = QAction("参数侧边栏", self)
+        self.panel_action.setCheckable(True)
+        self.panel_action.setShortcut("Ctrl+Alt+P")
+        self.panel_action.setToolTip("显示/隐藏右侧参数侧边栏（选中对象时自动弹出）")
+        self.panel_action.toggled.connect(self._toggle_property_panel)
+        v["panel"] = self.panel_action
+
         self.theme_action = QAction("深色模式", self)
         self.theme_action.setCheckable(True)
         self.theme_action.setIcon(icons.tool_icon("moon", self._theme))
@@ -330,6 +354,8 @@ class MainWindow(QMainWindow):
         v.addSeparator()
         v.addAction(vm["theme"])
         v.addSeparator()
+        v.addAction(vm["panel"])
+        v.addSeparator()
         v.addAction(vm["reset_settings"])
 
         hb = self.menuBar().addMenu("帮助(&H)")
@@ -351,12 +377,17 @@ class MainWindow(QMainWindow):
         # （矩形/圆角矩形/椭圆/三角形/菱形/五角星/直线/虚线/箭头/虚线箭头/双向箭头）
         self.shape_button = QToolButton(bar)
         self.shape_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        # 必须可选中：当前工具是形状时按钮要高亮，看起来才和「画笔/文字」这些
+        # 普通工具按钮一致（否则从下拉框选了矩形，工具栏上没有任何一个按钮是亮的）
+        self.shape_button.setCheckable(True)
         self.shape_button.setToolTip("形状：点开选择要画的图形")
         shape_menu = QMenu(self.shape_button)
         shape_menu.setToolTipsVisible(True)
         for kind in SHAPE_TOOL_KEYS:
             shape_menu.addAction(self.shape_actions[kind])
         self.shape_button.setMenu(shape_menu)
+        # 点开菜单只是"选形状"，不该把高亮状态点掉：关掉菜单后同步回真实状态
+        self.shape_button.clicked.connect(lambda _checked=False: self._sync_shape_button())
         bar.addWidget(self.shape_button)
         bar.addAction(self.tool_actions["text"])
         bar.addSeparator()
@@ -414,16 +445,20 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"当前工具：{tool.name}", 2000)
 
     def _sync_shape_button(self) -> None:
-        """让「形状」按钮的图标/提示反映当前选中的形状。"""
+        """让「形状」按钮的图标/高亮/提示反映当前选中的形状。"""
         button = getattr(self, "shape_button", None)
         if button is None:
             return
         current = self.settings.current_tool()
-        if current not in SHAPE_SPECS:
+        is_shape = current in SHAPE_SPECS
+        if not is_shape:
+            # 不是形状工具时，按钮图标仍显示"上次用的形状"，只是不高亮
             current = self.settings.shape_kind()
         action = self.shape_actions.get(current) or self.shape_actions["rect"]
         button.setIcon(action.icon())
         button.setToolTip(f"形状：{shape_label(str(action.data()))}（点开选择其它图形）")
+        if button.isCheckable():
+            button.setChecked(is_shape)
 
     # --------------------------------------------------------- 样式联动
     def _apply_style_state(self) -> None:
@@ -441,6 +476,8 @@ class MainWindow(QMainWindow):
         # 文字工具的颜色存在排版参数里，设置里也同步一份
         self.text_format = self.text_format.copy(color=QColor(color))
         self.settings.set_text_format(self.text_format)
+        # 有选中对象时，工具栏改颜色也直接作用到它们（和参数侧边栏一致）
+        self._on_panel_changed({"color": QColor(color)})
 
     def _on_thickness_changed(self, value: float) -> None:
         self.settings.set_thickness(value)
@@ -451,16 +488,18 @@ class MainWindow(QMainWindow):
         # 点一下就能把整条笔迹“吃掉”，看起来就像整块删除。
         self.tools["eraser"].size = max(8.0, min(48.0, value * 2 + 8))
         # 注意：文字字号**不再**跟着粗细走 —— 文字有自己的字号参数
-        # （在文字对话框里设置，并记在设置文件中）。
+        # （在参数侧边栏里设置，并记在设置文件中）。
+        self._on_panel_changed({"width": float(value)})
 
     def _on_line_style_changed(self, style: str) -> None:
-        """线型变化：作用到画笔与所有形状工具，保存到设置。"""
+        """线型变化：作用到画笔与所有形状工具，保存到设置，也作用于选中对象。"""
         self.settings.set_line_style(style)
         self.settings.sync()
         # 画笔也算描边工具：选了虚线/点线之后手绘笔迹也该是虚线
         self.tools["pen"].line_style = style
         for kind in SHAPE_TOOL_KEYS:
             self.tools[kind].line_style = style
+        self._on_panel_changed({"line_style": style})
         current = self.settings.current_tool()
         label = LINE_STYLE_LABELS.get(style, style)
         if current in SHAPE_SPECS and SHAPE_SPECS[current][2]:
@@ -469,13 +508,12 @@ class MainWindow(QMainWindow):
         else:
             self.statusBar().showMessage(f"线型：{label}（画笔与形状都用它）", 2000)
 
-    def _on_text_format_changed(self, fmt: TextFormat) -> None:
-        """文字对话框里改了颜色时，同步工具栏颜色按钮与设置。"""
-        self.text_format = fmt.copy()
-        self.settings.set_text_format(self.text_format)
-        if self.color_picker.color() != fmt.color:
-            self.color_picker.set_color(QColor(fmt.color), emit=False)
-            self.settings.set_color(fmt.color)
+    def _toggle_property_panel(self, visible: bool) -> None:
+        if visible:
+            self.property_panel.show()
+            self._refresh_property_panel()
+        else:
+            self.property_panel.hide()
 
     # ========================================================== 历史/撤销
     @property
@@ -505,8 +543,10 @@ class MainWindow(QMainWindow):
                                    Qt.ConnectionType.UniqueConnection)
         stack.cleanChanged.connect(self._on_clean_changed,
                                    Qt.ConnectionType.UniqueConnection)
-        # 选中变化会影响「组合/取消组合」是否可用
+        # 选中变化会影响「组合/取消组合」是否可用，以及参数侧边栏显示什么
         page.scene.selectionChanged.connect(self._update_edit_actions,
+                                            Qt.ConnectionType.UniqueConnection)
+        page.scene.selectionChanged.connect(self._refresh_property_panel,
                                             Qt.ConnectionType.UniqueConnection)
         self.view.undo_stack = stack
 
@@ -744,6 +784,203 @@ class MainWindow(QMainWindow):
             message += "，已按视图大小缩放"
         self.statusBar().showMessage(message, 4000)
         return True
+
+    # ========================================================== 参数侧边栏
+    def _create_property_panel(self) -> None:
+        """右侧参数侧边栏：改参数 + 实时预览 + 输入文字内容。
+
+        **默认常驻显示、不随选中状态自动弹出/收起**：
+        Qt 的 dock 一显一隐会改变 central widget 的尺寸，画布的视口映射跟着变，
+        用户刚点中的位置会"跳"走（点 A 拖到 B 时东西跑偏）。所以它像编辑器里的
+        属性面板一样固定占位，需要更大画布时用「视图 → 参数侧边栏」（Ctrl+Alt+P）关掉。
+        """
+        self.property_panel = PropertyPanel(self, self.settings)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.property_panel)
+        self.property_panel.show()
+        self.property_panel.changed.connect(self._on_panel_changed)
+        # 参数调节是「边拖边看」的：先实时应用，停手 ≈0.35 秒后再压一条撤销命令，
+        # 这样拖滑块不会往撤销栈里塞几十条命令。
+        self._style_timer = QTimer(self)
+        self._style_timer.setSingleShot(True)
+        self._style_timer.setInterval(350)
+        self._style_timer.timeout.connect(self._commit_style_changes)
+        self._pending_style = None
+        self._suspend_panel = False
+
+    def _selection_items(self) -> list:
+        scene = self.view.scene()
+        if scene is None:
+            return []
+        return [item for item in scene.selectedItems() if item.isVisible()]
+
+    def _refresh_property_panel(self) -> None:
+        """根据当前选中对象刷新侧边栏（显示哪些分组、各是多少）。"""
+        panel = getattr(self, "property_panel", None)
+        if panel is None:
+            return
+        items = self._selection_items()
+        self._suspend_panel = True
+        try:
+            panel.bind(self._describe_selection(items) if items else TargetInfo())
+        finally:
+            self._suspend_panel = False
+
+    def _describe_selection(self, items: list) -> TargetInfo:
+        """把选中的对象翻译成侧边栏要显示的参数（多选时取第一个对象的值）。"""
+        first = items[0]
+        count = len(items)
+        info = TargetInfo(count=count)
+
+        if isinstance(first, GroupItem):
+            info.kind = "group"
+            info.title = f"组合（{len(first.children_items())} 个对象）"
+            info.hint = "改这里的参数会作用到组合内所有成员"
+            members = first.children_items()
+            info.group_size = len(members)
+            first = members[0] if members else first
+        if count > 1 and info.kind != "group":
+            info.title = f"多选：{count} 个对象"
+            info.hint = "参数会同时应用到选中的对象"
+
+        if isinstance(first, TextItem):
+            if info.kind != "group":
+                info.kind = "text"
+                info.title = ("字体框" if first.is_box() else "文字") + (
+                    f" ×{count}" if count > 1 else "")
+            info.text = first.toPlainText()
+            info.text_color = QColor(first.defaultTextColor())
+            font = first.font()
+            info.font_family = font.family()
+            info.pixel_size = float(font.pixelSize())
+            info.bold = font.bold()
+            info.italic = font.italic()
+            info.align = first.text_align()
+            info.width = None
+            info.line_style = None
+            if first.is_box():
+                info.box_width = first.text_width()
+                info.box_height = first.box_height()
+                info.is_text_box = True
+                info.hint = info.hint or "拖手柄可自由拉伸框；双击框即可在这里输入文字"
+            return info
+
+        if isinstance(first, ImageItem):
+            if info.kind != "group":
+                info.kind = "image"
+                info.title = "图片" + (f" ×{count}" if count > 1 else "")
+            info.scale_percent = first.scale_x() * 100.0
+            info.opacity_percent = first.opacity() * 100.0
+            return info
+
+        if isinstance(first, (StrokeItem,)):
+            if info.kind != "group":
+                info.kind = "stroke"
+                info.title = "笔迹" + (f" ×{count}" if count > 1 else "")
+            info.color = first.outline_color()
+            info.width = first.outline_width()
+            info.line_style = first.current_line_style()
+            return info
+
+        if isinstance(first, (RectItem, PolygonShapeItem)) or (
+                hasattr(first, "raw_label") and hasattr(first, "outline_color")):
+            if info.kind != "group":
+                info.kind = "shape"
+                info.title = "图形" + (f" ×{count}" if count > 1 else "")
+            info.color = first.outline_color()
+            info.width = first.outline_width()
+            info.line_style = first.current_line_style()
+            fill = first.fill_color() if hasattr(first, "fill_color") else None
+            info.has_fill = fill is not None
+            info.fill = fill or QColor("#ffffff")
+            label = first.raw_label() if hasattr(first, "raw_label") else {}
+            label = label or {}
+            info.text = str(label.get("text", ""))
+            info.text_color = qcolor_from_rgba(label.get("color", [0, 0, 0, 255]))
+            info.font_family = str(label.get("font_family", ""))
+            info.pixel_size = float(label.get("pixel_size", 16.0))
+            info.bold = bool(label.get("bold", False))
+            info.italic = bool(label.get("italic", False))
+            info.align = str(label.get("align", "center"))
+            if not info.hint:
+                info.hint = "「文字参数」里可以给图形写入内部文字（含字体设置）"
+            return info
+
+        if hasattr(first, "outline_color"):
+            if info.kind != "group":
+                info.kind = "line"
+                info.title = "线段" + (f" ×{count}" if count > 1 else "")
+            info.color = first.outline_color()
+            info.width = first.outline_width()
+            info.line_style = first.current_line_style()
+            return info
+
+        info.kind = "group" if info.kind == "group" else "mixed"
+        if info.kind != "group":
+            info.title = f"选中 {count} 个对象"
+            info.hint = "这个类型没有可调参数"
+        return info
+
+    # --------------------------------------------------------- 实时应用参数
+    def _on_panel_changed(self, changes: dict) -> None:
+        if self._suspend_panel or not changes:
+            return
+        targets = style_targets(self._selection_items())
+        if not targets:
+            return
+        if self._pending_style is None:
+            self._pending_style = {"old": {}, "new": {}}
+        for item in targets:
+            if item not in self._pending_style["old"]:
+                state = item.style_state() if hasattr(item, "style_state") else None
+                if state is None:
+                    continue
+                self._pending_style["old"][item] = state
+            apply_style_changes(item, changes)
+            if isValid(item):
+                self._pending_style["new"][item] = item.style_state()
+        # 记住文字排版，下一次新建字体框就用这套参数
+        if isinstance(changes.get("text"), str) or "pixel_size" in changes:
+            self._remember_text_defaults(targets)
+        self._style_timer.start()
+
+    def _remember_text_defaults(self, targets) -> None:
+        """把刚改过的文字排版记为默认，下一次新建字体框就用这套。"""
+        for item in targets:
+            if isinstance(item, TextItem):
+                self.text_format = TextFormat.from_item(item)
+                try:
+                    self.settings.set_text_format(self.text_format)
+                except Exception:  # noqa: BLE001 —— 写不进去不影响画布
+                    pass
+                return
+
+    def _commit_style_changes(self) -> None:
+        """停手之后把这一串参数改动压成一条撤销命令。"""
+        pending = self._pending_style
+        self._pending_style = None
+        if not pending or not pending["new"]:
+            return
+        old = {item: state for item, state in pending["old"].items() if isValid(item)}
+        new = {item: state for item, state in pending["new"].items() if isValid(item)}
+        if not new:
+            return
+        if all(old.get(item) == new.get(item) for item in new):
+            return                      # 数值没变（例如只是重新聚焦），不记历史
+        stack = self.undo_stack
+        if stack is not None and isValid(stack):
+            stack.push(StyleStatesCommand(old, new, "修改参数"))
+
+    def focus_text_input(self, item) -> None:
+        """双击文字对象：弹出侧边栏并把光标送进内容框。"""
+        scene = self.view.scene()
+        if scene is not None and item.scene() is scene:
+            scene.clearSelection()
+            item.setSelected(True)
+        self.property_panel.show()
+        self.property_panel.raise_()
+        self._refresh_property_panel()
+        self.property_panel.focus_text_editor()
+        self.statusBar().showMessage("在右侧「参数 → 文字参数」里输入文字，画布实时预览", 4000)
 
     # ========================================================== 拖拽导入
     def dragEnterEvent(self, event) -> None:

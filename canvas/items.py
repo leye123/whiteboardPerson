@@ -31,6 +31,7 @@ from PySide6.QtGui import (
     QPen,
     QPixmap,
     QPolygonF,
+    QTextOption,
     QTransform,
 )
 from PySide6.QtWidgets import (
@@ -281,6 +282,65 @@ class StrokeItem(QGraphicsPathItem):
         """当前「局部 → 场景」的平均缩放倍数（橡皮擦换算半径用）。"""
         return item_scene_scale(self)
 
+    # ---------------------------------------------------------- 样式快照 / 单项设置
+    def outline_color(self) -> QColor:
+        return QColor(self.pen().color())
+
+    def outline_width(self) -> float:
+        return float(self.pen().widthF())
+
+    def current_line_style(self) -> str:
+        return self._line_style
+
+    def set_outline_color(self, color) -> None:
+        pen = self.pen()
+        pen.setColor(QColor(color))
+        self.setPen(pen)
+        self._apply_dash_offset()
+        self.update()
+
+    def set_outline_width(self, width: float) -> None:
+        pen = self.pen()
+        pen.setWidthF(max(0.1, float(width)))
+        self.setPen(pen)
+        self._apply_dash_offset()
+        self.update()
+
+    def set_line_style(self, style) -> None:
+        """切换线型（参数侧边栏用）：相位保持不变，只换图案。"""
+        self._line_style = line_style_name(style)
+        pen = self.pen()
+        pen.setStyle(pen_style(self._line_style))
+        self.setPen(pen)
+        self._apply_dash_offset()
+        self.update()
+
+    def style_state(self) -> dict:
+        pen = self.pen()
+        return {
+            "color": rgba_list(pen.color()),
+            "thickness": round(pen.widthF(), 3),
+            "line_style": self._line_style,
+            "dash_offset": round(self._dash_offset, 3),
+        }
+
+    def restore_style_state(self, state: dict) -> None:
+        if not state:
+            return
+        pen = self.pen()
+        if state.get("color") is not None:
+            pen.setColor(qcolor_from_rgba(state["color"]))
+        if state.get("thickness") is not None:
+            pen.setWidthF(max(0.1, float(state["thickness"])))
+        if state.get("line_style") is not None:
+            self._line_style = line_style_name(state["line_style"])
+            pen.setStyle(pen_style(self._line_style))
+        self.setPen(pen)
+        if state.get("dash_offset") is not None:
+            self._dash_offset = float(state["dash_offset"] or 0.0)
+        self._apply_dash_offset()
+        self.update()
+
     def to_dict(self) -> dict:
         return {
             "type": self.TYPE,
@@ -327,6 +387,9 @@ def _common_geometry_dict(item, kind: str) -> dict:
         "line_style": line_style_name(item.pen().style()),
         "fill": rgba_list(item.brush().color())
         if item.brush().style() != Qt.BrushStyle.NoBrush else None,
+        # 图形内部的文字标签（含字体数据）：没有就写 null
+        "label": dict(item.raw_label()) if getattr(item, "raw_label", None)
+        and item.raw_label() else None,
     }
     radius = getattr(item, "radius_value", None)
     if callable(radius):        # 兼容写成方法的情况
@@ -346,6 +409,9 @@ def _apply_common_geometry(item, data: dict):
         item.setBrush(QColor(*fill[:4]))
     else:
         item.setBrush(QBrush(Qt.BrushStyle.NoBrush))
+    label = data.get("label")
+    if hasattr(item, "set_raw_label"):
+        item.set_raw_label(dict(label) if label else None)
     item.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
     pos = data.get("pos")
     if pos:
@@ -356,6 +422,94 @@ def _apply_common_geometry(item, data: dict):
 def _data_rect(data: dict) -> QRectF:
     return QRectF(float(data.get("x", 0.0)), float(data.get("y", 0.0)),
                   float(data.get("w", 0.0)), float(data.get("h", 0.0)))
+
+
+# ------------------------------------------------------------------ 图形内文字标签
+
+def make_label(text: str = "", family: str = "", pixel_size: float = 16.0,
+               color=None, bold: bool = False, italic: bool = False,
+               align: str = "center") -> dict:
+    """图形内部的文字标签（也用 TextFormat 那套字段，参数侧边栏可直接复用）。"""
+    return {
+        "text": str(text or ""),
+        "font_family": str(family or ""),
+        "pixel_size": float(pixel_size),
+        "color": rgba_list(QColor(color) if color is not None
+                           else QColor(Qt.GlobalColor.black)),
+        "bold": bool(bold),
+        "italic": bool(italic),
+        "align": align if align in ("left", "center", "right") else "center",
+    }
+
+
+def paint_label(painter: QPainter, rect: QRectF, label: dict) -> None:
+    """在图形内部居中绘制标签文字（自动折行、垂直居中）。
+
+    图形项自己的 ``paint()`` 里调用：画笔已经在图形项的局部坐标系里，
+    所以直接用图形的 rect 即可；标签不会影响图形项的 boundingRect/命中测试。
+    """
+    if not label:
+        return
+    text = str(label.get("text", ""))
+    if not text.strip():
+        return
+    font = QFont(str(label.get("font_family", "")) or QFont().family())
+    font.setPixelSize(int(max(6, float(label.get("pixel_size", 16.0)))))
+    font.setBold(bool(label.get("bold", False)))
+    font.setItalic(bool(label.get("italic", False)))
+    color = qcolor_from_rgba(label.get("color", [0, 0, 0, 255]))
+    align = {
+        "left": Qt.AlignmentFlag.AlignLeft,
+        "center": Qt.AlignmentFlag.AlignHCenter,
+        "right": Qt.AlignmentFlag.AlignRight,
+    }.get(str(label.get("align", "center")), Qt.AlignmentFlag.AlignHCenter)
+
+    painter.save()
+    painter.setPen(QPen(QColor(color)))
+    painter.setFont(font)
+    option = QTextOption(align | Qt.AlignmentFlag.AlignVCenter)
+    option.setWrapMode(QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
+    painter.drawText(QRectF(rect).adjusted(4.0, 4.0, -4.0, -4.0), text, option)
+    painter.restore()
+
+
+def label_text(label: dict) -> str:
+    return str((label or {}).get("text", ""))
+
+
+def shape_style_state(item) -> dict:
+    """描边形状（矩形/椭圆/多边形）的样式快照：描边、线宽、线型、填充、标签。"""
+    return {
+        "outline": rgba_list(item.pen().color()),
+        "outline_width": round(item.pen().widthF(), 3),
+        "line_style": line_style_name(item.pen().style()),
+        "fill": rgba_list(item.brush().color())
+        if item.brush().style() != Qt.BrushStyle.NoBrush else None,
+        "label": dict(item.raw_label()) if item.raw_label() else None,
+    }
+
+
+def apply_shape_style(item, state: dict) -> None:
+    if not state:
+        return
+    if state.get("outline") is not None:
+        pen = item.pen()
+        pen.setColor(qcolor_from_rgba(state["outline"]))
+        item.setPen(pen)
+    if state.get("outline_width") is not None:
+        pen = item.pen()
+        pen.setWidthF(max(0.1, float(state["outline_width"])))
+        item.setPen(pen)
+    if state.get("line_style") is not None:
+        pen = item.pen()
+        pen.setStyle(pen_style(state["line_style"]))
+        item.setPen(pen)
+    if "fill" in state:
+        fill = state.get("fill")
+        item.setBrush(QColor(*fill[:4]) if fill else QBrush(Qt.BrushStyle.NoBrush))
+    if "label" in state:
+        item.set_raw_label(dict(state["label"]) if state["label"] else None)
+    item.update()
 
 
 def local_rect_for(item, target: QRectF) -> QRectF:
@@ -470,7 +624,98 @@ def default_radius(rect: QRectF) -> float:
     return max(4.0, min(rect.width(), rect.height()) * 0.18)
 
 
-class RectItem(QGraphicsPathItem):
+class _ShapeLabelMixin:
+    """图形内文字标签 + 样式快照（矩形 / 椭圆 / 多边形共用）。
+
+    标签只影响绘制，不进入 ``boundingRect()``/``shape()`` ——
+    图形的尺寸仍由几何决定，标签按框内居中排版，放大缩小都跟着走。
+    """
+
+    _label = None                    # 类属性兜底，子类不用专门初始化
+
+    # -- 标签 --
+    def raw_label(self) -> dict:
+        return dict(self._label) if self._label else {}
+
+    def set_raw_label(self, label) -> None:
+        self._label = dict(label) if label else None
+        self.update()
+
+    def label_text(self) -> str:
+        return label_text(self._label)
+
+    def set_label_text(self, text: str) -> None:
+        if not self._label:
+            self._label = make_label()
+        self._label["text"] = str(text or "")
+        self.update()
+
+    # -- 绘制：先画图形本身，再把标签叠在上面 --
+    def paint(self, painter: QPainter, option, widget=None) -> None:
+        super().paint(painter, option, widget)
+        paint_label(painter, self.rect(), self._label)
+
+    # -- 样式快照（参数侧边栏 / 撤销）--
+    def style_state(self) -> dict:
+        return shape_style_state(self)
+
+    def restore_style_state(self, state: dict) -> None:
+        apply_shape_style(self, state)
+
+    # -- 单项设置 / 读取（参数侧边栏用）--
+    def outline_color(self) -> QColor:
+        return QColor(self.pen().color())
+
+    def outline_width(self) -> float:
+        return float(self.pen().widthF())
+
+    def current_line_style(self) -> str:
+        return line_style_name(self.pen().style())
+
+    def fill_color(self):
+        """填充色；没有填充时返回 None。"""
+        if self.brush().style() == Qt.BrushStyle.NoBrush:
+            return None
+        return QColor(self.brush().color())
+
+    # -- 单项设置（参数侧边栏实时改）--
+    def set_outline_color(self, color) -> None:
+        pen = self.pen()
+        pen.setColor(QColor(color))
+        self.setPen(pen)
+        self.update()
+
+    def set_outline_width(self, width: float) -> None:
+        pen = self.pen()
+        pen.setWidthF(max(0.1, float(width)))
+        self.setPen(pen)
+        self.update()
+
+    def set_line_style(self, style) -> None:
+        pen = self.pen()
+        pen.setStyle(pen_style(style))
+        self.setPen(pen)
+        self.update()
+
+    def set_fill_color(self, color) -> None:
+        self.setBrush(QColor(color) if color is not None
+                      else QBrush(Qt.BrushStyle.NoBrush))
+        self.update()
+
+    # -- 命中区 --
+    def interior_path(self):
+        """闭合图形"内部"的路径；``None`` 表示只有描边能点中。
+
+        v1.3.0：图形默认**不填充**，``shape()`` 只包含描边那一圈，
+        于是"点在矩形中间"什么都点不到 —— 用户想选中它、双击进去写文字
+        全都没反应。选择工具因此额外用这个路径判定（见
+        :meth:`canvas.scene.PageScene.items_at` 的 ``interior`` 参数），
+        橡皮擦仍按 ``shape()`` 精确判定，避免点一下空白就把大框整块擦掉。
+        """
+        return None
+
+
+class RectItem(_ShapeLabelMixin, QGraphicsPathItem):
     """矩形；``radius`` > 0 时就是圆角矩形。
 
     用路径实现（而不是 QGraphicsRectItem）是因为 QGraphicsRectItem 画不出圆角。
@@ -516,6 +761,9 @@ class RectItem(QGraphicsPathItem):
     def shape(self) -> QPainterPath:
         return stroked_shape(self.path(), self.pen().widthF())
 
+    def interior_path(self):
+        return self.path()
+
     def boundingRect(self) -> QRectF:
         return pen_bounds(self.path(), self.pen().widthF())
 
@@ -558,7 +806,7 @@ class RectItem(QGraphicsPathItem):
         return _apply_common_geometry(item, data)
 
 
-class EllipseItem(QGraphicsEllipseItem):
+class EllipseItem(_ShapeLabelMixin, QGraphicsEllipseItem):
     TYPE = "ellipse"
 
     def __init__(self, rect: QRectF, outline: QColor = None, width: float = 2.0,
@@ -577,6 +825,11 @@ class EllipseItem(QGraphicsEllipseItem):
         path = QPainterPath()
         path.addEllipse(self.rect())
         return stroked_shape(path, self.pen().widthF())
+
+    def interior_path(self):
+        path = QPainterPath()
+        path.addEllipse(self.rect())
+        return path
 
     def boundingRect(self) -> QRectF:
         margin = self.pen().widthF() / 2.0 + 1.0
@@ -640,7 +893,7 @@ def polygon_shape_path(kind: str, rect: QRectF) -> QPainterPath:
     return path
 
 
-class PolygonShapeItem(QGraphicsPathItem):
+class PolygonShapeItem(_ShapeLabelMixin, QGraphicsPathItem):
     """三角形 / 菱形 / 五角星（统一按外接矩形定义，方便拖拽绘制）。"""
 
     TYPE = "polygon"
@@ -675,6 +928,9 @@ class PolygonShapeItem(QGraphicsPathItem):
 
     def shape(self) -> QPainterPath:
         return stroked_shape(self.path(), self.pen().widthF())
+
+    def interior_path(self):
+        return self.path()
 
     def boundingRect(self) -> QRectF:
         return pen_bounds(self.path(), self.pen().widthF())
@@ -913,6 +1169,53 @@ class LineItem(QGraphicsItem):
             for head in heads:
                 painter.drawPolygon(head)
 
+    # ---------------------------------------------------------- 样式快照 / 单项设置
+    def outline_color(self) -> QColor:
+        return QColor(self._pen.color())
+
+    def outline_width(self) -> float:
+        return float(self._pen.widthF())
+
+    def current_line_style(self) -> str:
+        return line_style_name(self._pen.style())
+
+    def set_outline_color(self, color) -> None:
+        pen = QPen(self._pen)
+        pen.setColor(QColor(color))
+        self.set_pen(pen)
+
+    def set_outline_width(self, width: float) -> None:
+        pen = QPen(self._pen)
+        pen.setWidthF(max(0.1, float(width)))
+        self.set_pen(pen)
+
+    def set_line_style(self, style) -> None:
+        pen = QPen(self._pen)
+        pen.setStyle(pen_style(style))
+        self.set_pen(pen)
+
+    def style_state(self) -> dict:
+        return {
+            "outline": rgba_list(self._pen.color()),
+            "outline_width": round(self._pen.widthF(), 3),
+            "line_style": line_style_name(self._pen.style()),
+            "arrow": self._arrow,
+        }
+
+    def restore_style_state(self, state: dict) -> None:
+        if not state:
+            return
+        pen = QPen(self._pen)
+        if state.get("outline") is not None:
+            pen.setColor(qcolor_from_rgba(state["outline"]))
+        if state.get("outline_width") is not None:
+            pen.setWidthF(max(0.1, float(state["outline_width"])))
+        if state.get("line_style") is not None:
+            pen.setStyle(pen_style(state["line_style"]))
+        if state.get("arrow") is not None:
+            self._arrow = _normalize_arrow(state["arrow"])
+        self.set_pen(pen)
+
     # -- 序列化 --
     def to_dict(self) -> dict:
         return {
@@ -958,23 +1261,37 @@ TEXT_ALIGNS = ("left", "center", "right")
 
 
 class TextItem(QGraphicsTextItem):
-    """文字块：字体、字号、粗斜体、颜色、对齐、自动换行（固定文本宽度）都可自定义。
+    """文字块 / **字体框**。
 
-    自动换行的实现是 ``setTextWidth(w)``：Qt 会在 ``w`` 宽度内折行，
-    因此换行宽度本身也要序列化，重新打开才能保持同样的排版。
+    两种形态（用 ``box_h`` 区分，序列化兼容旧文件）：
+
+    * **字体框**（``box_h > 0``，v1.3.0 起文字工具拖出来的默认形态）：
+      框的尺寸是明确的，文字在框宽内自动折行；拖手柄**自由拉伸**（默认不等比），
+      改的是**框**而不是字号 —— 字号在参数侧边栏里单独调。
+    * **自适应**（``box_h <= 0``，旧文件里保存的文字）：框随文字大小走，
+      拖手柄等比改字号（保留 v1.3.0 之前的手感，旧文件打开后不会变形）。
+
+    字体、字号、粗斜体、颜色、对齐、折行宽度都可自定义；
+    ``_text_width`` 在字体框形态下就是框宽。
     """
 
     TYPE = "text"
+    MIN_BOX = 20.0
 
     def __init__(self, text: str, color: QColor, pixel_size: float = 16.0,
                  family: str = "", bold: bool = False, italic: bool = False,
                  wrap: bool = False, text_width: float = 300.0, align: str = "left",
-                 font_file: str = ""):
+                 font_file: str = "", box_height: float = 0.0):
         super().__init__(text)
         self._font_file = font_file or ""
         self.setDefaultTextColor(QColor(color))
-        self._wrap = bool(wrap)
-        self._text_width = float(text_width)
+        self._box_h = max(0.0, float(box_height or 0.0))
+        # 字体框形态一定有固定宽度（否则谈不上"框"）
+        self._wrap = True if self.is_box() else bool(wrap)
+        self._text_width = max(self.MIN_BOX, float(text_width))
+        if self.is_box():
+            # 框的左上角就是文字起点：去掉文档默认边距，手柄才对得上文字
+            self.document().setDocumentMargin(0.0)
         font = QFont(family) if family else QFont()
         font.setPixelSize(int(max(6, pixel_size)))
         font.setBold(bool(bold))
@@ -985,9 +1302,38 @@ class TextItem(QGraphicsTextItem):
         self.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
 
+    # -- 形态 --
+    def is_box(self) -> bool:
+        """是否「字体框」形态（有明确高度）。"""
+        return self._box_h > 0.0
+
+    def box_height(self) -> float:
+        return self._box_h
+
+    def is_empty(self) -> bool:
+        return not self.toPlainText().strip()
+
+    def set_box_size(self, width: float, height: float) -> None:
+        self.prepareGeometryChange()
+        self._text_width = max(self.MIN_BOX, float(width))
+        self._box_h = max(0.0, float(height))
+        self._wrap = True if self.is_box() else self._wrap
+        if self.is_box():
+            self.document().setDocumentMargin(0.0)
+        self._apply_wrap()
+        self.update()
+
+    # -- 内容 --
+    def set_text(self, text: str) -> None:
+        self.setPlainText(text or "")
+        self.update()
+
     # -- 排版 --
     def _apply_wrap(self) -> None:
-        self.setTextWidth(self._text_width if self._wrap else -1.0)
+        if self.is_box():
+            self.setTextWidth(self._text_width)
+        else:
+            self.setTextWidth(self._text_width if self._wrap else -1.0)
 
     def is_wrapped(self) -> bool:
         return self._wrap
@@ -998,7 +1344,7 @@ class TextItem(QGraphicsTextItem):
     def set_wrap(self, wrap: bool, text_width: float = None) -> None:
         self._wrap = bool(wrap)
         if text_width is not None:
-            self._text_width = max(20.0, float(text_width))
+            self._text_width = max(self.MIN_BOX, float(text_width))
         self._apply_wrap()
 
     def text_align(self) -> str:
@@ -1014,6 +1360,37 @@ class TextItem(QGraphicsTextItem):
             "right": Qt.AlignmentFlag.AlignRight,
         }[align] | Qt.AlignmentFlag.AlignTop)
         self.document().setDefaultTextOption(option)
+
+    # -- 单项样式设置（参数侧边栏用）--
+    def set_pixel_size(self, pixel_size: float) -> None:
+        font = self.font()
+        font.setPixelSize(int(max(6, min(400, pixel_size))))
+        self.setFont(font)
+        self.update()
+
+    def set_font_family(self, family: str, font_file: str = None) -> None:
+        font = self.font()
+        font.setFamily(family or "")
+        self.setFont(font)
+        if font_file is not None:
+            self._font_file = font_file
+        self.update()
+
+    def set_bold(self, on: bool) -> None:
+        font = self.font()
+        font.setBold(bool(on))
+        self.setFont(font)
+        self.update()
+
+    def set_italic(self, on: bool) -> None:
+        font = self.font()
+        font.setItalic(bool(on))
+        self.setFont(font)
+        self.update()
+
+    def set_text_color(self, color: QColor) -> None:
+        self.setDefaultTextColor(QColor(color))
+        self.update()
 
     def set_text_format(self, fmt) -> None:
         """用 :class:`core.text_format.TextFormat` 更新排版（编辑已有文字时用）。"""
@@ -1033,45 +1410,120 @@ class TextItem(QGraphicsTextItem):
     def font_file(self) -> str:
         return self._font_file
 
+    # ---------------------------------------------------------- 样式快照
+    def style_state(self) -> dict:
+        """参数侧边栏用：内容 + 排版 + 框尺寸（可整体保存/恢复）。"""
+        font = self.font()
+        return {
+            "text": self.toPlainText(),
+            "font_family": font.family(),
+            "pixel_size": int(font.pixelSize()),
+            "bold": font.bold(),
+            "italic": font.italic(),
+            "color": rgba_list(self.defaultTextColor()),
+            "align": self.text_align(),
+            "wrap": self._wrap,
+            "text_width": round(self._text_width, 3),
+            "box_h": round(self._box_h, 3),
+            "font_file": self._font_file,
+            "pos": [self.pos().x(), self.pos().y()],
+        }
+
+    def restore_style_state(self, state: dict) -> None:
+        self.prepareGeometryChange()
+        if "text" in state:
+            self.setPlainText(str(state["text"]))
+        font = self.font()
+        font.setFamily(str(state.get("font_family", font.family())))
+        font.setPixelSize(int(max(6, state.get("pixel_size", font.pixelSize()))))
+        font.setBold(bool(state.get("bold", font.bold())))
+        font.setItalic(bool(state.get("italic", font.italic())))
+        self.setFont(font)
+        if state.get("color") is not None:
+            self.setDefaultTextColor(qcolor_from_rgba(state["color"]))
+        self._font_file = str(state.get("font_file", self._font_file) or "")
+        self.set_text_align(str(state.get("align", self.text_align())))
+        self._box_h = max(0.0, float(state.get("box_h", self._box_h)))
+        self._text_width = max(self.MIN_BOX, float(state.get("text_width", self._text_width)))
+        self._wrap = bool(state.get("wrap", self._wrap)) or self.is_box()
+        self._apply_wrap()
+        pos = state.get("pos")
+        if pos:
+            self.setPos(QPointF(float(pos[0]), float(pos[1])))
+        self.update()
+
     # ---------------------------------------------------------- 自由伸缩
     def is_resizable(self) -> bool:
         return True
 
-    def resize_rect(self) -> QRectF:
-        """文字块的显示区域（场景坐标）。
+    def default_keep_aspect(self, handle_index: int) -> bool:
+        """字体框默认**自由拉伸**（拖四角也不等比），按住 Shift 才等比。
 
-        用 ``boundingRect`` 而不是 ``document().size()``：前者已经把字体、
-        换行宽度与对齐都算进去了。
+        自适应文字（旧文件）相反：它靠改字号缩放，横向拉扁会让字形变形，
+        所以保持等比。
         """
+        if self.is_box():
+            return False
+        from canvas.resize import CORNER_HANDLES
+
+        return handle_index in CORNER_HANDLES
+
+    def boundingRect(self) -> QRectF:
+        """字体框形态下，包围盒就是框本身（文字溢出也不改框）。"""
+        if self.is_box():
+            return QRectF(0.0, 0.0, self._text_width, self._box_h)
+        return super().boundingRect()
+
+    def shape(self) -> QPainterPath:
+        """字体框整块都可命中（空框也能点中、能双击进去输入）。"""
+        if self.is_box():
+            path = QPainterPath()
+            path.addRect(QRectF(0.0, 0.0, self._text_width, self._box_h))
+            return path
+        return super().shape()
+
+    def resize_rect(self) -> QRectF:
         return self.mapRectToScene(self.boundingRect())
 
     def resize_state(self) -> dict:
-        font = self.font()
-        return {
-            "pixel_size": int(font.pixelSize()),
-            "text_width": round(self._text_width, 3),
-            "pos": [self.pos().x(), self.pos().y()],
-        }
+        state = {"box_h": round(self._box_h, 3)}
+        state.update(self.style_state())
+        return state
 
     def restore_resize_state(self, state: dict) -> None:
-        font = self.font()
-        font.setPixelSize(int(max(6, state.get("pixel_size", font.pixelSize()))))
-        self.setFont(font)
-        if state.get("text_width") is not None:
-            self._text_width = max(20.0, float(state["text_width"]))
-            self._apply_wrap()
-        pos = state.get("pos")
-        if pos:
-            self.setPos(QPointF(pos[0], pos[1]))
-        self.update()
+        self.restore_style_state(state)
 
     def resize_with(self, index: int, point: QPointF, keep_aspect: bool = False) -> None:
-        """拖手柄缩放文字：改字号（等比），勾了自动换行时折行宽度一起缩放。
+        """拖手柄缩放。
 
-        文字不能像图片那样横向拉扁（字形会变形），所以这里始终等比：
-        按手柄所在方向算出倍数，取字号能落到的整数值，再反算出实际倍数，
-        把锚点（对角 / 对边）固定在原位。
+        * **字体框**：默认**不等比** —— 改的是框（宽 → 折行宽度，高 → 框高），
+          字号不动；按住 Shift 时才保持宽高比。
+        * **自适应文字**（旧文件）：等比改字号（横向拉扁会让字形变形）。
         """
+        from canvas.resize import resized_rect
+
+        if not self.is_box():
+            self._resize_font_only(index, point, keep_aspect)
+            return
+
+        rect = self.resize_rect()
+        if rect.width() <= 0 or rect.height() <= 0:
+            return
+        target = resized_rect(rect, index, point, keep_aspect)
+        offset = self.pos()
+        self.prepareGeometryChange()
+        self._text_width = max(self.MIN_BOX, target.width())
+        self._box_h = max(self.MIN_BOX, target.height())
+        self._wrap = True
+        self._apply_wrap()
+        # 手柄的锚点（对角/对边）保持不动
+        self.setPos(QPointF(target.left(), target.top()))
+        if offset != self.pos():
+            self.update()
+
+    def _resize_font_only(self, index: int, point: QPointF,
+                          keep_aspect: bool = False) -> None:
+        """自适应文字：等比改字号（保留旧行为）。"""
         from canvas.resize import BOTTOM_HANDLES, LEFT_HANDLES, RIGHT_HANDLES, TOP_HANDLES
         from canvas.resize import anchor_point, resized_rect
 
@@ -1102,7 +1554,7 @@ class TextItem(QGraphicsTextItem):
         font.setPixelSize(new_size)
         self.setFont(font)
         if self._wrap:
-            self._text_width = max(20.0, self._text_width * actual)
+            self._text_width = max(self.MIN_BOX, self._text_width * actual)
             self._apply_wrap()
         self.update()
 
@@ -1119,6 +1571,8 @@ class TextItem(QGraphicsTextItem):
             "italic": font.italic(),
             "wrap": self._wrap,
             "text_width": round(self._text_width, 3),
+            # > 0 表示这是一个「字体框」（固定框尺寸）
+            "box_h": round(self._box_h, 3),
             "align": getattr(self, "_align", "left"),
             # 导入字体记录来源文件：换台机器打开时能提示字体来自哪里
             "font_file": self._font_file,
@@ -1137,6 +1591,7 @@ class TextItem(QGraphicsTextItem):
             text_width=float(data.get("text_width", 300.0)),
             align=data.get("align", "left"),
             font_file=data.get("font_file", ""),
+            box_height=float(data.get("box_h", 0.0)),
         )
         pos = data.get("pos")
         if pos:
@@ -1203,6 +1658,34 @@ class ImageItem(QGraphicsPixmapItem):
         self.setPos(target.topLeft())
         self.update()
 
+    # ---------------------------------------------------------- 样式快照 / 单项设置
+    def scale_x(self) -> float:
+        return float(self.transform().m11())
+
+    def scale_y(self) -> float:
+        return float(self.transform().m22())
+
+    def set_scale(self, sx: float, sy: float = None) -> None:
+        """按比例设置显示尺寸（参数侧边栏用），传入 0.5 表示 50%。"""
+        sy = sx if sy is None else sy
+        sx = max(self.MIN_SCALE, min(self.MAX_SCALE, float(sx)))
+        sy = max(self.MIN_SCALE, min(self.MAX_SCALE, float(sy)))
+        self.prepareGeometryChange()
+        self.setTransform(QTransform.fromScale(sx, sy))
+        self.update()
+
+    def style_state(self) -> dict:
+        state = transform_state(self)
+        state["opacity"] = round(self.opacity(), 3)
+        return state
+
+    def restore_style_state(self, state: dict) -> None:
+        if not state:
+            return
+        apply_transform_state(self, state)
+        if state.get("opacity") is not None:
+            self.setOpacity(float(state["opacity"]))
+
     def to_dict(self) -> dict:
         image = self.pixmap().toImage()
         from PySide6.QtCore import QBuffer, QByteArray, QIODevice
@@ -1244,7 +1727,8 @@ class GroupItem(QGraphicsItemGroup):
     """把若干图形项组合成一个整体（Ctrl+G）。
 
     组合之后它就像「一个常规图形」：点击/框选选中的是整个组，拖动整体移动，
-    拖手柄整体缩放（走 transform，里面的内容一起变大变小），橡皮碰到整体删除；
+    拖手柄整体缩放（走 transform，里面的内容一起变大变小），按 Delete 整体删除
+    （橡皮擦不碰它 —— 橡皮只擦手绘笔迹）；
     拆开（Ctrl+Shift+G）后各回原位。
 
     几个必须注意的点：
@@ -1321,6 +1805,24 @@ class GroupItem(QGraphicsItemGroup):
     def scene_scale(self) -> float:
         return item_scene_scale(self)
 
+    # ---------------------------------------------------------- 样式快照（递归到成员）
+    def style_state(self) -> dict:
+        """组合的样式快照 = 各成员自己的快照（参数改动会作用到所有成员）。"""
+        state = transform_state(self)
+        state["children"] = [
+            child.style_state() for child in self._children
+            if getattr(child, "style_state", None) is not None]
+        return state
+
+    def restore_style_state(self, state: dict) -> None:
+        if not state:
+            return
+        children = state.get("children") or []
+        for child, child_state in zip(self._children, children):
+            if getattr(child, "restore_style_state", None) is not None:
+                child.restore_style_state(child_state)
+        apply_transform_state(self, state)
+
     # ---------------------------------------------------------- 序列化
     def to_dict(self) -> dict:
         transform = self.transform()
@@ -1350,6 +1852,104 @@ class GroupItem(QGraphicsItemGroup):
         if pos:
             item.setPos(QPointF(float(pos[0]), float(pos[1])))
         return item
+
+
+def apply_style_changes(item, changes: dict) -> None:
+    """把参数侧边栏的一组改动应用到图形项上（只处理该对象支持的那些项）。
+
+    ``changes`` 里只会出现用户真正动过的那几项，例如 ``{"color": QColor}``、
+    ``{"text": "..."}``、``{"width": 4.0}``。同一把键在不同对象上含义不同：
+
+    * 文字对象：``color`` / ``text_color`` 都是文字颜色，``text`` 是内容，可改框尺寸；
+    * 图形（矩形/椭圆/多边形）：``color`` 是描边色，``text`` 是**图形内部的标签**；
+    * 笔迹 / 线段：``color`` 是线条颜色、``width`` 是线宽、``line_style`` 是线型；
+    * 图片：``scale_percent``（100% = 位图原始像素）与 ``opacity_percent``。
+    """
+    if item is None or not changes:
+        return
+
+    # ---- 文字对象 ----
+    if isinstance(item, TextItem):
+        if "text" in changes:
+            item.set_text(str(changes["text"]))
+        if changes.get("font_family") is not None:
+            item.set_font_family(str(changes["font_family"]))
+        if "pixel_size" in changes:
+            item.set_pixel_size(float(changes["pixel_size"]))
+        if "bold" in changes:
+            item.set_bold(bool(changes["bold"]))
+        if "italic" in changes:
+            item.set_italic(bool(changes["italic"]))
+        if changes.get("align"):
+            item.set_text_align(str(changes["align"]))
+        if changes.get("text_color") is not None:
+            item.set_text_color(changes["text_color"])
+        elif changes.get("color") is not None:
+            item.set_text_color(changes["color"])
+        if item.is_box() and ("box_width" in changes or "box_height" in changes):
+            item.set_box_size(float(changes.get("box_width", item.text_width())),
+                              float(changes.get("box_height", item.box_height())))
+        return
+
+    # ---- 图形内部的文字标签 ----
+    label_keys = ("text", "font_family", "pixel_size", "bold", "italic",
+                  "align", "text_color")
+    if hasattr(item, "set_raw_label") and any(key in changes for key in label_keys):
+        label = item.raw_label() or make_label()
+        if "text" in changes:
+            label["text"] = str(changes["text"])
+        if changes.get("font_family") is not None:
+            label["font_family"] = str(changes["font_family"])
+        if "pixel_size" in changes:
+            label["pixel_size"] = float(changes["pixel_size"])
+        if "bold" in changes:
+            label["bold"] = bool(changes["bold"])
+        if "italic" in changes:
+            label["italic"] = bool(changes["italic"])
+        if changes.get("align"):
+            label["align"] = str(changes["align"])
+        if changes.get("text_color") is not None:
+            label["color"] = rgba_list(changes["text_color"])
+        item.set_raw_label(label)
+
+    # ---- 描边 / 线型 / 填充 ----
+    if changes.get("color") is not None and hasattr(item, "set_outline_color"):
+        item.set_outline_color(changes["color"])
+    if "width" in changes and hasattr(item, "set_outline_width"):
+        item.set_outline_width(float(changes["width"]))
+    if changes.get("line_style") and hasattr(item, "set_line_style"):
+        item.set_line_style(str(changes["line_style"]))
+    if "fill" in changes and hasattr(item, "setBrush"):
+        fill = changes["fill"]
+        item.setBrush(QColor(fill) if fill is not None else QBrush(Qt.BrushStyle.NoBrush))
+        item.update()
+
+    # ---- 图片 ----
+    if isinstance(item, ImageItem):
+        if "scale_percent" in changes:
+            item.set_scale(float(changes["scale_percent"]) / 100.0)
+        if "opacity_percent" in changes:
+            item.setOpacity(max(0.05, min(1.0, float(changes["opacity_percent"]) / 100.0)))
+
+
+def style_targets(items) -> list:
+    """把选中的对象展开成"真正要改参数"的图形项列表。
+
+    组合本身没有颜色/线宽，改参数时应该落到**组内每个成员**身上，
+    所以这里把组合摊平成它的成员（普通对象原样返回）。
+    """
+    targets = []
+    for item in items:
+        if item is None:
+            continue
+        if isinstance(item, GroupItem):
+            for child in item.children_items():
+                if hasattr(child, "style_state"):
+                    targets.append(child)
+            continue
+        if hasattr(item, "style_state"):
+            targets.append(item)
+    return targets
 
 
 # ------------------------------------------------------------------ 工厂

@@ -868,80 +868,169 @@ def test_icon_file_has_all_sizes():
         assert not missing, f"resources 里的 .ico 缺少尺寸 {missing}"
 
 
-def test_text_dialog_widgets_drive_the_format():
-    """文字对话框真控件走一遍：参数改动能落到 TextFormat 上，导入字体进列表。"""
-    from PySide6.QtWidgets import QFileDialog, QMessageBox
+def test_property_panel_binds_and_emits_changes():
+    """参数侧边栏：按选中对象回填数值，改动只把动过的那几项发出去。"""
+    from widgets.property_panel import PropertyPanel, TargetInfo
 
-    from core.settings import AppSettings
-    from core.text_format import TextFormat
-    from widgets.text_dialog import TextDialog
+    panel = PropertyPanel()
+    received = []
+    panel.changed.connect(received.append)
 
-    settings = AppSettings()
-    dialog = TextDialog(None, "输入文字", "初始文本",
-                        TextFormat(pixel_size=20, color=QColor("#112233")), settings)
-    dialog.editor.setPlainText("要保存的文字")
+    # 图形（带内部文字标签）
+    panel.bind(TargetInfo(
+        kind="shape", title="图形", color=QColor("#123456"), width=6.0,
+        line_style="dash", has_fill=True, fill=QColor("#ffe0b2"),
+        text="标签", text_color=QColor("#ff0000"), font_family="Consolas",
+        pixel_size=18, bold=True, italic=False, align="center"))
+    assert not panel.outline_group.isHidden(), "图形应当看到「图形参数」"
+    assert not panel.text_group.isHidden(), "有标签时应当看到「文字参数」"
+    assert panel.image_group.isHidden(), "图形不该出现「图片参数」"
+    assert panel.color_button.color().name() == "#123456"
+    assert panel.width_slider.value() == 6
+    assert panel.style_combo.currentData() == "dash"
+    assert panel.fill_check.isChecked()
+    assert panel.fill_button.isEnabled()
+    assert panel.text_edit.toPlainText() == "标签"
+    assert panel.size_spin.value() == 18
+    assert panel.bold_button.isChecked()
+    assert panel.align_combo.currentData() == "center"
+    assert panel.font_combo.count() > 0, "字体列表不能为空"
+    assert received == [], f"回填数值不该发 changed：{received}"
 
-    # 字体列表必须非空，且当前项就是传入的排版
-    assert dialog.font_combo.count() > 0
-    assert dialog.result_text() == "要保存的文字"
-    assert dialog.current_format().pixel_size == 20
-    assert dialog.current_format().color.name() == "#112233"
+    # 用户改动：只带改动项
+    panel.size_spin.setValue(30)
+    assert received[-1] == {"pixel_size": 30.0}
+    panel.color_button.set_color(QColor("#00aa00"))
+    assert received[-1]["color"].name() == "#00aa00"
+    panel.text_edit.setPlainText("新标签")
+    assert received[-1] == {"text": "新标签"}
+    panel.width_slider.setValue(12)
+    assert received[-1] == {"width": 12.0}
+    panel.bold_button.setChecked(False)
+    assert received[-1] == {"bold": False}
+    panel.text_color_button.set_color(QColor("#0000ff"))
+    assert received[-1]["text_color"].name() == "#0000ff"
+    # 取消填充：要把 None 也发出去（否则「取消不了填充」）
+    panel.fill_check.setChecked(False)
+    assert received[-1] == {"fill": None}
+    assert not panel.fill_button.isEnabled()
 
-    # 改控件 -> 排版跟着变（字号/粗体/颜色/换行/宽度/对齐）
-    dialog.size_spin.setValue(33)
-    dialog.bold_button.setChecked(True)
-    dialog.italic_button.setChecked(True)
-    dialog.color_picker.set_color(QColor("#aa3344"))
-    dialog.wrap_check.setChecked(True)
-    dialog.width_spin.setValue(260)
-    dialog.align_combo.setCurrentIndex(dialog.align_combo.findData("center"))
-    fmt = dialog.current_format()
-    assert fmt.pixel_size == 33 and fmt.bold and fmt.italic
-    assert fmt.color.name() == "#aa3344"
-    assert fmt.wrap and fmt.text_width == 260 and fmt.align == "center"
-    # 编辑区实时预览：字体/颜色/折行都套上了
-    assert dialog.editor.font().pixelSize() == 33
-    assert dialog.editor.lineWrapMode() == dialog.editor.LineWrapMode.FixedPixelWidth
-    assert dialog.editor.lineWrapColumnOrWidth() == 260
+    # 字体框：出现框宽/框高
+    panel.bind(TargetInfo(kind="text", title="字体框", text="内容",
+                          text_color=QColor("#000000"), pixel_size=20,
+                          box_width=160.0, box_height=80.0, is_text_box=True))
+    assert not panel.text_group.isHidden()
+    assert panel.outline_group.isHidden(), "文字框不该出现描边参数"
+    assert panel.box_width_spin.value() == 160
+    assert panel.box_height_spin.value() == 80
+    assert not panel.box_height_spin.isHidden(), "字体框要能改框高"
+    panel.box_width_spin.setValue(300)
+    assert received[-1] == {"box_width": 300.0}
 
-    # 关闭自动换行后折行宽度不可编辑
-    dialog.wrap_check.setChecked(False)
-    assert not dialog.width_spin.isEnabled()
-    assert dialog.editor.lineWrapMode() == dialog.editor.LineWrapMode.NoWrap
+    # 图片：只出现图片参数
+    panel.bind(TargetInfo(kind="image", title="图片",
+                          scale_percent=250.0, opacity_percent=80.0))
+    assert not panel.image_group.isHidden()
+    assert panel.scale_spin.value() == 250
+    assert panel.opacity_spin.value() == 80
+    panel.scale_spin.setValue(50)
+    assert received[-1] == {"scale_percent": 50.0}
 
-    # 空文本不该被当成有效输入
-    dialog.editor.setPlainText("   ")
-    assert dialog.result_text() == ""
+    # 未选中：全部收起
+    panel.bind(TargetInfo())
+    assert panel.outline_group.isHidden() and panel.text_group.isHidden()
+    assert panel.image_group.isHidden()
+    panel.close()
 
-    # 导入字体：走真实的对话框逻辑（只把文件选择与提示框替换掉）
-    source = None
-    for candidate in ("C:/Windows/Fonts/consola.ttf", "C:/Windows/Fonts/arial.ttf",
-                      "C:/Windows/Fonts/segoeui.ttf"):
-        if os.path.exists(candidate):
-            source = candidate
-            break
-    if source:
-        original_open = QFileDialog.getOpenFileName
-        original_info = QMessageBox.information
-        original_warning = QMessageBox.warning
-        QFileDialog.getOpenFileName = staticmethod(lambda *a, **k: (source, ""))
-        QMessageBox.information = staticmethod(lambda *a, **k: None)
-        QMessageBox.warning = staticmethod(lambda *a, **k: None)
-        try:
-            dialog.import_font()
-            family = dialog.font_combo.currentData()
-            assert family, "导入字体后应当自动选中该字体"
-            assert dialog.font_combo.findData(family) >= 0
-            from core import fonts as fonts_module
-            assert fonts_module.stored_paths(settings), "导入的字体要记进设置"
-        finally:
-            QFileDialog.getOpenFileName = original_open
-            QMessageBox.information = original_info
-            QMessageBox.warning = original_warning
-        settings.reset()
-    else:
-        print("      （跳过导入字体部分：本机找不到可用的 .ttf）")
-    dialog.close()
+
+def test_apply_style_changes_per_item_type():
+    """侧边栏改动落到图形项上：同一把键在不同对象上含义不同。"""
+    from canvas.items import GroupItem, apply_style_changes, style_targets
+
+    # 文字对象：color 就是文字颜色，text 就是内容，能改框尺寸
+    text = TextItem("", QColor(0, 0, 0), 20, text_width=160.0, box_height=80.0)
+    apply_style_changes(text, {"text": "内容", "color": QColor("#112233"),
+                               "pixel_size": 26.0, "bold": True,
+                               "box_width": 300.0, "box_height": 120.0})
+    assert text.toPlainText() == "内容"
+    assert text.defaultTextColor().name() == "#112233"
+    assert text.font().pixelSize() == 26 and text.font().bold()
+    assert abs(text.text_width() - 300.0) < 0.01
+    assert abs(text.box_height() - 120.0) < 0.01
+
+    # 图形：color 是描边，text 是内部标签（含字体数据）
+    rect = RectItem(QRectF(0.0, 0.0, 200.0, 100.0), QColor(0, 0, 0), 2.0)
+    apply_style_changes(rect, {"color": QColor("#d35400"), "width": 7.0,
+                               "line_style": "dash", "text": "图里的字",
+                               "pixel_size": 22.0, "text_color": QColor("#00695c"),
+                               "fill": QColor("#fff3e0")})
+    assert rect.outline_color().name() == "#d35400"
+    assert rect.outline_width() == 7.0
+    assert rect.current_line_style() == "dash"
+    assert rect.label_text() == "图里的字"
+    label = rect.raw_label()
+    assert label["pixel_size"] == 22.0
+    assert qcolor_from_rgba(label["color"]).name() == "#00695c"
+    assert rect.fill_color().name() == "#fff3e0"
+    apply_style_changes(rect, {"fill": None})
+    assert rect.fill_color() is None
+
+    # 笔迹 / 线段
+    stroke = StrokeItem([QPointF(0, 0), QPointF(50, 0)], QColor(0, 0, 0), 2.0,
+                        line_style="dot")
+    apply_style_changes(stroke, {"color": QColor("#00aa55"), "width": 9.0,
+                                 "line_style": "dash_dot"})
+    assert stroke.outline_color().name() == "#00aa55"
+    assert stroke.outline_width() == 9.0
+    assert stroke.current_line_style() == "dash_dot"
+    line = LineItem(QPointF(0, 0), QPointF(100, 0), QColor(0, 0, 0), 2.0)
+    apply_style_changes(line, {"width": 4.0, "line_style": "dot"})
+    assert line.outline_width() == 4.0 and line.current_line_style() == "dot"
+
+    # 图片：缩放百分比与不透明度
+    pixmap = QPixmap(100, 50)
+    pixmap.fill(QColor(0, 0, 0))
+    image = ImageItem(pixmap)
+    apply_style_changes(image, {"scale_percent": 50.0, "opacity_percent": 40.0})
+    assert abs(image.scale_x() - 0.5) < 0.001
+    assert abs(image.opacity() - 0.4) < 0.001
+
+    # 组合：参数落到每个成员身上
+    scene = WhiteboardScene()
+    a = RectItem(QRectF(0, 0, 50, 50), QColor(0, 0, 0), 1.0)
+    b = StrokeItem([QPointF(0, 0), QPointF(20, 0)], QColor(0, 0, 0), 1.0)
+    scene.addItem(a)
+    scene.addItem(b)
+    group = GroupItem([a, b])
+    scene.addItem(group)
+    targets = style_targets([group])
+    assert set(targets) == {a, b}, "组合要摊平成成员"
+    for item in targets:
+        apply_style_changes(item, {"color": QColor("#8e24aa")})
+    assert a.outline_color().name() == "#8e24aa"
+    assert b.outline_color().name() == "#8e24aa"
+
+
+def test_style_states_command_undoes_parameters():
+    """参数改动可撤销：一次调节（含多项）回退成一条命令。"""
+    from canvas.items import apply_style_changes
+    from core.history import StyleStatesCommand
+
+    rect = RectItem(QRectF(0.0, 0.0, 100.0, 50.0), QColor("#000000"), 2.0)
+    old = rect.style_state()
+    apply_style_changes(rect, {"color": QColor("#c0392b"), "width": 8.0,
+                               "text": "标签"})
+    new = rect.style_state()
+    stack = QUndoStack()
+    stack.push(StyleStatesCommand({rect: old}, {rect: new}, "修改参数"))
+    assert rect.outline_color().name() == "#c0392b"
+    stack.undo()
+    assert rect.outline_color().name() == "#000000"
+    assert rect.outline_width() == 2.0
+    assert rect.label_text() == ""
+    stack.redo()
+    assert rect.outline_color().name() == "#c0392b"
+    assert rect.label_text() == "标签"
 
 
 def test_pen_stroke_line_style_and_eraser_keeps_it():
@@ -1145,41 +1234,52 @@ def test_image_resize_and_roundtrip():
     assert item.resize_state() == state_after
 
 
-def test_text_resize_scales_font_size():
-    """文字：拖手柄改字号（等比），勾了换行时折行宽度一起缩放。"""
+def test_text_box_creation_and_free_resize():
+    """字体框：框尺寸固定、默认**非等比**拉伸（改框不改字号）；旧文字仍按字号缩放。"""
     from canvas.resize import BOTTOM_RIGHT, RIGHT
 
-    item = TextItem("缩放测试的文字内容", QColor(0, 0, 0), 20, wrap=True,
-                    text_width=200.0)
-    item.setPos(QPointF(50.0, 50.0))
-    assert item.is_resizable()
-    rect = item.resize_rect()
-    assert rect.width() > 1 and rect.height() > 1
+    box = TextItem("", QColor(0, 0, 0), 20, text_width=160.0, box_height=80.0)
+    assert box.is_box() and box.is_empty()
+    assert abs(box.boundingRect().width() - 160.0) < 0.01
+    assert abs(box.boundingRect().height() - 80.0) < 0.01
+    assert not box.shape().isEmpty(), "空字体框也要能点中/双击"
 
-    # 右边手柄：横向拖到 1.5 倍 -> 字号与折行宽度都放大
-    target_x = rect.left() + rect.width() * 1.5
-    item.resize_with(RIGHT, QPointF(target_x, rect.center().y()), keep_aspect=True)
-    assert item.font().pixelSize() > 20
-    assert item.text_width() > 200.0
-    assert item.font().pixelSize() <= 400
-    # 位置锚点：右边手柄的锚点是左边，左边应当基本不动
-    assert abs(item.pos().x() - 50.0) < 1.5
+    box.setPos(QPointF(50.0, 50.0))
+    box.resize_with(BOTTOM_RIGHT, QPointF(370.0, 290.0))
+    assert abs(box.text_width() - 320.0) < 0.5, "拖手柄改的是框宽"
+    assert abs(box.box_height() - 240.0) < 0.5, "拖手柄改的是框高"
+    assert box.font().pixelSize() == 20, "拉伸字体框不该改字号"
+    assert box.is_box()
 
-    # 缩小：字号跟着变小，但不会低于下限
-    item.resize_with(RIGHT, QPointF(item.pos().x() + 5.0, rect.center().y()),
-                     keep_aspect=True)
-    assert item.font().pixelSize() >= 6
+    # 框内文字按框宽折行
+    box.set_text("这是一段比较长的文字，应当按框的宽度自动折行显示")
+    assert box.boundingRect().width() == box.text_width()
 
-    # 缩放状态可存可读（撤销用）
-    state = item.resize_state()
-    assert set(state) == {"pixel_size", "text_width", "pos"}
-    item.restore_resize_state({"pixel_size": 30, "text_width": 150.0,
-                              "pos": [10.0, 20.0]})
-    assert item.font().pixelSize() == 30
-    assert abs(item.text_width() - 150.0) < 0.01
-    assert item.pos() == QPointF(10.0, 20.0)
-    item.restore_resize_state(state)
-    assert item.font().pixelSize() == state["pixel_size"]
+    # 样式/尺寸状态往返（参数侧边栏与撤销都靠它）
+    state = box.style_state()
+    box.set_box_size(100.0, 100.0)
+    box.restore_style_state(state)
+    assert abs(box.text_width() - 320.0) < 0.5 and abs(box.box_height() - 240.0) < 0.5
+
+    # 序列化：框尺寸要能存下来
+    data = box.to_dict()
+    assert data["box_h"] > 0
+    clone = TextItem.from_dict(data)
+    assert clone.is_box()
+    assert abs(clone.text_width() - box.text_width()) < 0.01
+    assert abs(clone.box_height() - box.box_height()) < 0.01
+    assert clone.toPlainText() == box.toPlainText()
+
+    # 旧文件（没有 box_h）：自适应模式，拖手柄仍按字号等比缩放
+    legacy = TextItem("旧文字", QColor(0, 0, 0), 20, wrap=True, text_width=200.0)
+    assert not legacy.is_box()
+    legacy_from_dict = TextItem.from_dict(
+        {"type": "text", "text": "旧", "pixel_size": 18, "text_width": 200})
+    assert not legacy_from_dict.is_box(), "旧文件里的文字应当是自适应模式"
+    before_size = legacy.font().pixelSize()
+    legacy.setPos(QPointF(0.0, 0.0))
+    legacy.resize_with(RIGHT, QPointF(400.0, 0.0))
+    assert legacy.font().pixelSize() > before_size, "旧文字仍按字号缩放"
 
 
 def test_shapes_and_strokes_are_resizable():
@@ -1447,8 +1547,120 @@ def test_erasing_keeps_every_line_style_exactly():
                 f"点划线擦完不该变成虚线（{original_runs} -> {fragment_runs}）"
 
 
-# ------------------------------------------------------------------ 运行器
+def test_closed_shapes_are_clickable_inside():
+    """图形默认不填充：点图形中间也要能选中它（选择工具用 interior 判定）。
 
+    旧代码只用 ``shape()``（描边那一圈）判定，点在矩形/椭圆中间什么都
+    点不到 —— 选不中、双击也进不去写文字。橡皮擦仍按描边判定，避免
+    点一下空白就把整个大框擦掉。
+    """
+    from canvas.items import EllipseItem, PolygonShapeItem, StrokeItem
+
+    scene = WhiteboardScene()
+    rect = RectItem(QRectF(0.0, 0.0, 200.0, 100.0), QColor(0, 0, 0), 2.0)
+    scene.addItem(rect)
+    center = QPointF(100.0, 50.0)
+    assert scene.topmost_item_at(center) is None, "描边判定本来点不到矩形中间"
+    assert scene.topmost_item_at(center, interior=True) is rect
+    # 图形外面依然点不到（不能因为加了内部命中就把命中区放大到外面）
+    assert scene.topmost_item_at(QPointF(100.0, 400.0), interior=True) is None
+
+    # 椭圆只有"圈内"算命中：外接矩形的四角仍然点不到
+    scene_e = WhiteboardScene()
+    ellipse = EllipseItem(QRectF(0.0, 0.0, 200.0, 100.0), QColor(0, 0, 0), 2.0)
+    scene_e.addItem(ellipse)
+    assert scene_e.topmost_item_at(QPointF(100.0, 50.0), interior=True) is ellipse
+    assert scene_e.topmost_item_at(QPointF(6.0, 6.0), interior=True) is None, \
+        "椭圆外接矩形的角落里不该命中"
+
+    # 自交路径（五角星）的正中心用 WindingFill 判定，也算命中
+    scene2 = WhiteboardScene()
+    star = PolygonShapeItem("star", QRectF(0.0, 0.0, 200.0, 190.0))
+    scene2.addItem(star)
+    assert scene2.topmost_item_at(QPointF(100.0, 95.0), interior=True) is star
+
+    # 笔迹/直线没有内部，行为不变
+    scene3 = WhiteboardScene()
+    stroke = StrokeItem([QPointF(0.0, 0.0), QPointF(200.0, 0.0)],
+                        QColor(0, 0, 0), 2.0)
+    scene3.addItem(stroke)
+    assert scene3.topmost_item_at(QPointF(100.0, 40.0), interior=True) is None
+
+
+def test_eraser_only_erases_strokes():
+    """橡皮擦只擦手绘笔迹（v1.3.0）。
+
+    以前橡皮碰到矩形/椭圆/多边形/直线/字体框/图片会**整块删掉**：
+    用户只想擦掉一点手绘线，结果旁边的图形整个消失，非常容易误删。
+    现在除笔迹（``StrokeItem``）之外的对象橡皮一概不碰，
+    要删它们请用选择工具选中后按 Delete。
+    """
+    from canvas.items import EllipseItem, GroupItem, ImageItem, LineItem
+    from tools.eraser_tool import EraserTool
+
+    class _FakeView:
+        """``_erase_at`` 只需要 ``scene()``。"""
+
+        def __init__(self, scene):
+            self._scene = scene
+
+        def scene(self):
+            return self._scene
+
+    scene = WhiteboardScene()
+    rect = RectItem(QRectF(0.0, 0.0, 200.0, 120.0), QColor(0, 0, 0), 3.0)
+    ellipse = EllipseItem(QRectF(250.0, 0.0, 160.0, 120.0), QColor(0, 0, 0), 3.0)
+    line = LineItem(QPointF(0.0, 160.0), QPointF(200.0, 160.0),
+                    QColor(0, 0, 0), 3.0)
+    text = TextItem("字体框也别碰", QColor(0, 0, 0), 24)
+    text.set_box_size(200.0, 90.0)
+    text.setPos(250.0, 160.0)
+    pixmap = QPixmap(60, 40)
+    pixmap.fill(QColor("#1a4fb4"))
+    image = ImageItem(pixmap)
+    image.setPos(0.0, 300.0)
+    protected = (rect, ellipse, line, text, image)
+    for item in protected:
+        scene.addItem(item)
+
+    tool = EraserTool(size=16.0)
+    view = _FakeView(scene)
+    for item in protected:
+        # 描边中点 + 图形中心都擦一遍（以前这两处都可能把对象整块删掉）
+        targets = [item.sceneBoundingRect().center()]
+        if hasattr(item, "path"):
+            targets.append(item.mapToScene(item.path().pointAtPercent(0.05)))
+        for target in targets:
+            tool._erase_at(QPointF(target), view)
+            tool._reset()
+
+    for item in protected:
+        assert item.scene() is scene, f"{type(item).__name__} 被橡皮擦掉了"
+    assert tool._removed == [] and tool._added == [], "橡皮擦不该动非笔迹对象"
+
+    # 组合里的笔迹也不单独编辑（要擦先 Ctrl+Shift+G 拆开）
+    inner_points = [QPointF(float(i) * 5.0, 500.0) for i in range(40)]
+    inner = StrokeItem(inner_points, QColor(0, 0, 0), 3.0)
+    scene.addItem(inner)
+    group = GroupItem()
+    group.add_item(inner)
+    scene.addItem(group)
+    tool._erase_at(QPointF(100.0, 500.0), view)
+    tool._reset()
+    assert inner.scene() is scene and inner.parentItem() is group, \
+        "组合里的笔迹不该被橡皮单独擦断"
+
+    # 笔迹本身照样能擦断
+    points = [QPointF(float(index) * 5.0, 700.0) for index in range(60)]
+    stroke = StrokeItem(points, QColor(0, 0, 0), 3.0)
+    scene.addItem(stroke)
+    tool._erase_at(QPointF(150.0, 700.0), view)
+    assert len(tool._removed) == 1 and len(tool._added) == 2, \
+        f"笔迹应当被擦成两段（removed={len(tool._removed)}, added={len(tool._added)}）"
+    assert stroke not in scene.items(), "原笔迹应当被碎片替换掉"
+
+
+# ------------------------------------------------------------------ 运行器
 
 def _run_all() -> int:
     tests = [(name, obj) for name, obj in sorted(globals().items())
