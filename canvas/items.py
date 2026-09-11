@@ -65,6 +65,11 @@ LINE_STYLE_LABELS = {
 DEFAULT_LINE_STYLE = "solid"
 
 # Qt 画笔样式 -> 名字（反查用，只认标准样式）
+#
+# 注意：``CustomDashLine`` 是**无法反推**的 —— 设过 ``setDashOffset()`` 之后
+# 任何虚线线型都会变成它，所以它只能给一个保守的默认值。
+# 需要"用户到底选了哪种线型"时，请用 :meth:`StrokeItem.line_style()`，
+# 别用这个函数去猜（橡皮擦曾经因此把点线/点划线擦成虚线）。
 _PEN_STYLE_NAMES = {
     Qt.PenStyle.SolidLine: "solid",
     Qt.PenStyle.DashLine: "dash",
@@ -217,26 +222,37 @@ class StrokeItem(QGraphicsPathItem):
     def _apply_dash_offset(self) -> None:
         """把相位写进画笔。
 
-        两个坑：
+        三个坑（第一个曾让实线笔迹在擦除后**整段隐形**）：
 
-        * ``QPen.setDashOffset()`` 的单位是**线宽**（和 ``setDashPattern`` 一致），
-          不是像素 —— 直接传弧长会得到完全错误的相位（实测差几像素到整段虚线）。
-          所以这里除以线宽换算成 Qt 的单位。
-        * 设过 offset 之后画笔样式会变成 ``CustomDashLine``
-          （内置虚线的图案被展开成 ``dashPattern()``），可以利用这一点
-          拿到虚线周期，把偏移归一到 ``[0, 一个周期)``，免得长笔迹把值堆到几万。
+        * **实线不能设相位**：``QPen.setDashOffset()`` 会把样式切成
+          ``CustomDashLine`` 并且**留下空图案**，而「空图案的自定义虚线」
+          Qt 什么都不画 —— 实线碎片于是隐形；拖橡皮时碎片不断重建，
+          有的有墨有的没墨，用户看到的就是「闪烁」。这里只对真正有虚线图案的
+          线型（dash/dot/dash_dot）设置相位。
+        * ``setDashOffset()`` 的单位是**线宽**（和 ``setDashPattern`` 一致），
+          不是像素 —— 直接传弧长会得到完全错误的相位。
+        * 设过 offset 之后 ``pen().style()`` 变成 ``CustomDashLine``，
+          所以线型单独记在 ``_line_style`` 上；顺便用展开后的图案算出周期，
+          把偏移归一到 ``[0, 一个周期)``。
         """
-        pen = self.pen()
+        pen = QPen(self.pen())
         width = pen.widthF() or 1.0
-        if self._dash_offset:
-            pen.setDashOffset(self._dash_offset / width)
-            pattern = pen.dashPattern()
-            period = sum(pattern) * width if pattern else 0.0
-            if period > 0:
-                normalized = self._dash_offset % period
-                if abs(normalized - self._dash_offset) > 1e-9:
-                    self._dash_offset = normalized
-                    pen.setDashOffset(normalized / width)
+        offset = self._dash_offset if self._line_style != "solid" else 0.0
+        if offset:
+            candidate = QPen(pen)
+            candidate.setDashOffset(offset / width)
+            pattern = candidate.dashPattern()
+            if not pattern:
+                # 兜底：空图案的虚线画不出任何东西，宁可放弃相位（画成实线才对）
+                offset = 0.0
+            else:
+                period = sum(pattern) * width
+                if period > 0:
+                    offset %= period
+                    candidate = QPen(pen)
+                    candidate.setDashOffset(offset / width)
+                pen = candidate
+        self._dash_offset = offset
         super().setPen(pen)
 
     # ---------------------------------------------------------- 绘制接口

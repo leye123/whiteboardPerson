@@ -14,6 +14,7 @@ from PySide6.QtGui import (
     QKeySequence,
     QPainter,
     QPixmap,
+    QUndoStack,
 )
 from PySide6.QtWidgets import (
     QFileDialog,
@@ -479,8 +480,20 @@ class MainWindow(QMainWindow):
     # ========================================================== 历史/撤销
     @property
     def undo_stack(self):
-        """当前页的撤销栈（每页独立，避免跨页误撤销）。"""
-        return self.pages[self.page_index].undo_stack
+        """当前页的撤销栈（每页独立，避免跨页误撤销）。
+
+        切换/新建/删除页面的过程中，旧页面的撤销栈信号可能在新页数之下到达，
+        此时 ``page_index`` 会短暂越界（甚至页面列表为空）。
+        这里做一次夹取，避免在 Qt 槽里抛 ``IndexError``
+        （异常发生在槽里只会打到 stderr，用户看不到，但会打断界面刷新）。
+        """
+        if not self.pages:
+            # 没有页面时给一个临时栈，让调用方（菜单/快捷键）不至于炸
+            if getattr(self, "_orphan_stack", None) is None:
+                self._orphan_stack = QUndoStack(self)
+            return self._orphan_stack
+        index = min(max(self.page_index, 0), len(self.pages) - 1)
+        return self.pages[index].undo_stack
 
     def _bind_page(self, page: BoardPage) -> None:
         """把某一页的撤销栈接到界面刷新上（切页时也会重新绑定视图）。
@@ -518,6 +531,8 @@ class MainWindow(QMainWindow):
                 page.undo_stack.setClean()
 
     def _on_history_changed(self) -> None:
+        if not isValid(self):
+            return
         stack = self.undo_stack
         if not isValid(stack):
             return
@@ -895,21 +910,33 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"已取消 {len(groups)} 个组合", 3000)
 
     def _update_edit_actions(self) -> None:
-        """根据当前选中情况启用/禁用「组合」「取消组合」（并给出悬浮提示）。"""
-        scene = self.view.scene()
+        """根据当前选中情况启用/禁用「组合」「取消组合」（并给出悬浮提示）。
+
+        关窗时场景的 ``selectionChanged`` 可能比菜单动作晚一步到达，
+        此时 QAction 的 C++ 对象已经被删除 —— 直接访问会抛
+        ``RuntimeError: Internal C++ object already deleted``。
+        这类异常发生在 Qt 槽里只会打到 stderr，但会打断收尾流程，所以先校验存活。
+        """
         actions = getattr(self, "_edit_menu_actions", None)
-        if not scene or not actions:
+        if not isValid(self) or not actions:
+            return
+        group_action = actions.get("group")
+        ungroup_action = actions.get("ungroup")
+        if not (isValid(group_action) and isValid(ungroup_action)):
+            return
+        scene = self.view.scene() if isValid(self.view) else None
+        if scene is None:
             return
         selected = [it for it in scene.selectedItems() if it.isVisible()]
         groupable = [it for it in selected
                      if not it.parentItem() and not isinstance(it, GroupItem)]
         groups = [it for it in selected if isinstance(it, GroupItem)]
-        actions["group"].setEnabled(len(groupable) >= 2)
-        actions["ungroup"].setEnabled(bool(groups))
-        actions["group"].setToolTip(
+        group_action.setEnabled(len(groupable) >= 2)
+        ungroup_action.setEnabled(bool(groups))
+        group_action.setToolTip(
             "把选中的多个对象组合成一个整体（Ctrl+G）：可整体选中/移动/自由缩放"
             + ("" if len(groupable) >= 2 else "——当前选中不足两个对象"))
-        actions["ungroup"].setToolTip("拆开选中的组合（Ctrl+Shift+G）")
+        ungroup_action.setToolTip("拆开选中的组合（Ctrl+Shift+G）")
 
     def clear_current_page(self) -> None:
         scene = self.view.scene()

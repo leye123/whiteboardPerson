@@ -135,13 +135,22 @@ class EraserTool(BaseTool):
         segments = [run for run in runs if len(run) >= MIN_SEGMENT_POINTS]
 
         pen = item.pen()
-        style = line_style_name(pen.style())
+        # 线型必须问图形项要，**不能**从 pen.style() 反推：
+        # 设过虚线相位的笔迹，画笔样式已经变成 CustomDashLine，
+        # 反推会一律得到 "dash" —— 于是点线/点划线被擦过之后变成虚线。
+        # 线型必须问图形项要，**不能**从 pen.style() 反推：
+        # 设过虚线相位的笔迹，画笔样式已经变成 CustomDashLine，
+        # 反推会一律得到 "dash" —— 于是点线/点划线被擦过之后变成虚线
+        # （碎片起点的相位不为周期整数倍时才触发，所以是「有时候会变成虚线」）。
+        style = item.line_style()
         origin = QPointF(item.pos())
         transform = item.transform()
         # 虚线相位：碎片要知道自己「从原笔迹多长的地方开始」，
         # 否则虚线图案会在断口处重新起头，断口之后的虚线整段移位。
-        lengths = cumulative_lengths(points)
-        base_offset = item.dash_offset()
+        # **实线完全不需要**：给实线笔迹设相位会让 Qt 把它变成「空白虚线」
+        # （见 StrokeItem._apply_dash_offset），碎片会整段隐形、拖橡皮时闪烁。
+        lengths = cumulative_lengths(points) if style != "solid" else None
+        base_offset = item.dash_offset() if style != "solid" else 0.0
         self._remove(item, scene)
         cursor = 0
         for run in segments:
@@ -150,11 +159,11 @@ class EraserTool(BaseTool):
             except ValueError:                       # 理论上不会发生
                 start_index = cursor
             cursor = start_index
+            dash_offset = base_offset + lengths[start_index] if lengths else 0.0
             # 碎片要继承原笔迹的颜色/线宽/线型/缩放，否则擦一下虚线会变成实线、
             # 缩放过的笔迹会突然跳回原始大小
             segment = StrokeItem(run, pen.color(), pen.widthF(), pos=origin,
-                                 line_style=style,
-                                 dash_offset=base_offset + lengths[start_index])
+                                 line_style=style, dash_offset=dash_offset)
             segment.setTransform(transform)
             scene.addItem(segment)
             self._added.append(segment)

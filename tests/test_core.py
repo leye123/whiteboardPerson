@@ -1334,6 +1334,119 @@ def test_group_command_and_serialization():
     assert abs(a.sceneBoundingRect().width() - rect_before.width()) < 0.5
 
 
+def test_erasing_solid_stroke_keeps_it_solid_and_visible():
+    """实线笔迹被擦断后必须仍是「看得见的实线」。
+
+    曾经的 bug：给实线碎片设虚线相位会让 Qt 把画笔切成 ``CustomDashLine``
+    并留下**空图案** —— 空图案的自定义虚线 Qt 什么都不画，碎片于是整段隐形；
+    拖橡皮时碎片不断重建，有的有墨有的没墨，看起来就是「闪烁」，
+    残留的笔迹也像是换了一种线型。
+    """
+    from tools.eraser_tool import EraserTool
+
+    points = [QPointF(float(index) * 6.0, 0.0) for index in range(40)]
+    scene = WhiteboardScene()
+    stroke = StrokeItem(points, QColor(0, 0, 0), 3.0, line_style="solid")
+    scene.addItem(stroke)
+    tool = EraserTool()
+
+    # 模拟一次拖拽擦除：每一步都要检查「墨迹没有凭空消失」
+    for step in (60.0, 90.0, 120.0):
+        for target in list(scene.items()):
+            if isinstance(target, StrokeItem):
+                tool._split_stroke(target, QPointF(step, 0.0), 10.0, scene)
+        fragments = [it for it in scene.items() if isinstance(it, StrokeItem)]
+        assert fragments, f"擦到 x={step} 时笔迹整段没了"
+        for fragment in fragments:
+            assert fragment.line_style() == "solid", "实线碎片不能变成别的线型"
+            assert fragment.pen().style() is Qt.PenStyle.SolidLine, \
+                "实线碎片不该被切成 CustomDashLine（空图案会整段隐形）"
+            assert _ink_columns([fragment]), \
+                f"擦到 x={step} 时有碎片完全没有墨迹（会表现为闪烁）"
+
+    # 实线笔迹即使被塞进一个 dash_offset，也必须照常画出来
+    weird = StrokeItem(points, QColor(0, 0, 0), 3.0, line_style="solid",
+                       dash_offset=123.0)
+    assert weird.pen().style() is Qt.PenStyle.SolidLine
+    assert weird.dash_offset() == 0.0, "实线不该保留相位（Qt 会把它变成空白虚线）"
+    assert _ink_columns([weird])
+
+    # 各种虚线线型的碎片都必须「有图案、有墨迹」
+    for style in ("dash", "dot", "dash_dot"):
+        dashed = StrokeItem(points, QColor(0, 0, 0), 3.0, line_style=style)
+        scene2 = WhiteboardScene()
+        scene2.addItem(dashed)
+        tool2 = EraserTool()
+        tool2._split_stroke(dashed, QPointF(60.0, 0.0), 10.0, scene2)
+        assert tool2._added, f"{style} 笔迹应当被擦成两段"
+        for fragment in tool2._added:
+            assert fragment.line_style() == style
+            assert fragment.pen().dashPattern(), f"{style} 碎片的虚线图案不能为空"
+            assert _ink_columns([fragment]), f"{style} 碎片必须有墨迹"
+
+
+def test_erasing_keeps_every_line_style_exactly():
+    """点线/点划线被橡皮擦过之后不能变成虚线（多遍擦除也要保持）。
+
+    曾经的 bug：橡皮擦从 ``pen.style()`` 反推线型，而设过虚线相位的笔迹
+    画笔样式已经变成 ``CustomDashLine`` —— 反推一律得到 "dash"，
+    于是点线、点划线擦一下（尤其是连续拖拽的第二遍）就变成虚线。
+    """
+    from tools.eraser_tool import EraserTool
+
+    # Qt 内置线型的图案（单位 = 线宽）——用来核对碎片没有换线型
+    expected_patterns = {"dash": [4.0, 2.0], "dot": [1.0, 2.0],
+                         "dash_dot": [4.0, 2.0, 1.0, 2.0]}
+    points = [QPointF(float(index) * 6.0, 0.0) for index in range(40)]
+
+    for style, expected in expected_patterns.items():
+        scene = WhiteboardScene()
+        stroke = StrokeItem(points, QColor(0, 0, 0), 3.0, line_style=style)
+        scene.addItem(stroke)
+        tool = EraserTool()
+
+        # 模拟一次拖拽：多遍擦除（第二遍擦的就是「带相位的新碎片」）。
+        # 擦除点特意选得让碎片起点**不在相位周期的整数倍上**，
+        # 这样碎片一定带着非零相位（画笔会被 Qt 变成 CustomDashLine），
+        # 正是旧代码把点线/点划线误判成虚线的那条路径。
+        for step in (66.0, 156.0, 210.0):
+            for target in list(scene.items()):
+                if isinstance(target, StrokeItem):
+                    tool._split_stroke(target, QPointF(step, 0.0), 10.0, scene)
+
+        fragments = [it for it in scene.items() if isinstance(it, StrokeItem)]
+        assert fragments, f"{style} 笔迹被擦没了"
+        assert any(fragment.dash_offset() != 0.0 for fragment in fragments), \
+            f"{style} 用例没有覆盖「带相位的碎片」这条路径（测试本身失效了）"
+        for fragment in fragments:
+            assert fragment.line_style() == style, \
+                f"{style} 碎片变成了 {fragment.line_style()}"
+            pattern = [round(value, 3) for value in fragment.pen().dashPattern()]
+            assert pattern == expected, \
+                f"{style} 碎片的虚线图案变成了 {pattern}（应为 {expected}）"
+            assert _ink_columns([fragment]), f"{style} 碎片没有墨迹"
+
+        # 碎片的墨迹节奏要和原笔迹一致：点线的墨迹段数远多于虚线
+        def run_count(items):
+            columns = sorted(_ink_columns(items, width=460, height=60,
+                                          offset=(30, 30)))
+            return sum(1 for index, column in enumerate(columns)
+                       if index == 0 or column != columns[index - 1] + 1)
+
+        original_runs = run_count([StrokeItem(points, QColor(0, 0, 0), 3.0,
+                                              line_style=style)])
+        fragment_runs = run_count(fragments)
+        assert fragment_runs > 2, f"{style} 碎片应当分成多段墨迹"
+        # 擦掉 3 处之后剩 4 段左右，墨迹段数应当仍与线型的疏密匹配：
+        # 点线（周期 3×线宽）的段数明显多于虚线（周期 6×线宽）
+        if style == "dot":
+            assert fragment_runs > original_runs * 0.5, \
+                f"点线擦完不该变成稀疏的虚线（{original_runs} -> {fragment_runs}）"
+        if style == "dash_dot":
+            assert fragment_runs > original_runs * 0.4, \
+                f"点划线擦完不该变成虚线（{original_runs} -> {fragment_runs}）"
+
+
 # ------------------------------------------------------------------ 运行器
 
 

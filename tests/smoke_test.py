@@ -21,8 +21,13 @@ for _stream in (sys.stdout, sys.stderr):
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QEvent, QPoint, QPointF, QRect, Qt
-from PySide6.QtGui import QImage, QMouseEvent
-from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox
+from PySide6.QtGui import QColor, QImage, QMouseEvent, QPainter
+from PySide6.QtWidgets import (
+    QApplication,
+    QFileDialog,
+    QMessageBox,
+    QStyleOptionGraphicsItem,
+)
 
 # ---------------------------------------------------------------- 隔离用户设置
 def _make_tmp_dir() -> str:
@@ -176,6 +181,26 @@ def main() -> int:
     ok(survivors and points_after < points_before,
        f"拖拽只擦掉经过的采样点（{points_before} -> {points_after} 点，"
        f"{len(survivors)} 段）")
+    # 实线笔迹擦断后必须仍然是「看得见的实线」：曾经因为给实线碎片设了
+    # 虚线相位，Qt 把画笔切成「空图案的 CustomDashLine」，碎片整段隐形 →
+    # 拖橡皮时有的有墨有的没墨，看起来就是闪烁。
+    ok(all(it.line_style() == "solid" for it in survivors),
+       "擦断后的碎片仍然是实线（不会换成别的线型）")
+    ok(all(it.pen().style() is Qt.PenStyle.SolidLine for it in survivors),
+       "实线碎片没有被切成 CustomDashLine（空图案会整段隐形）")
+    steps_ink = []
+    for fragment in survivors:
+        shot = QImage(60, 30, QImage.Format.Format_ARGB32)
+        shot.fill(QColor(255, 255, 255))
+        painter = QPainter(shot)
+        painter.translate(10 - fragment.points()[0].x(), 15 - fragment.points()[0].y())
+        fragment.paint(painter, QStyleOptionGraphicsItem(), None)
+        painter.end()
+        ink = sum(1 for y in range(shot.height()) for x in range(shot.width())
+                  if shot.pixelColor(x, y).lightness() < 200)
+        steps_ink.append(ink)
+    ok(all(ink > 0 for ink in steps_ink),
+       f"每个碎片都真的画得出墨迹（{steps_ink}）—— 不会出现「隐形碎片」")
     win.undo_stack.undo()
     app.processEvents()
     restored = [it for it in win.view.scene().items()
@@ -396,7 +421,6 @@ def main() -> int:
     # 曾经因为 painter.scale(factor) 与 scene.render(target=整图) 双重缩放，
     # 只导出了左上角那一块（表现为「导出图片被裁掉一半」）。
     from PySide6.QtCore import QRectF
-    from PySide6.QtGui import QColor
     from canvas.items import RectItem
 
     export_scene = win.view.scene()
@@ -987,6 +1011,23 @@ def main() -> int:
     app.processEvents()
     ok(not [it for it in scene.items() if isinstance(it, GroupItem)],
        "按真实 Ctrl+Shift+G 键即可取消组合")
+
+    # ---- 21. 页面越界/为空时撤销栈不能抛异常（曾经在 Qt 槽里抛 IndexError，
+    #          异常只会打到 stderr，界面刷新会静默中断）
+    saved_pages, saved_index = win.pages, win.page_index
+    failure = None
+    fallback = None
+    try:
+        win.pages = []
+        win.page_index = 5
+        win._on_history_changed()
+        fallback = win.undo_stack
+    except Exception as exc:  # noqa: BLE001
+        failure = exc
+    finally:
+        win.pages, win.page_index = saved_pages, saved_index
+    ok(failure is None and fallback is not None,
+       f"页面为空/越界时撤销栈不抛异常（{failure!r}）")
 
     print(f"\n全部 {checks} 项冒烟检查通过")
     return 0
