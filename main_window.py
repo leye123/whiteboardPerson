@@ -27,13 +27,16 @@ from PySide6.QtWidgets import (
 from shiboken6 import isValid
 
 from canvas.view import WhiteboardView
-from canvas.items import LINE_STYLE_LABELS, ImageItem
+from canvas.items import GroupItem, LINE_STYLE_LABELS, ImageItem
 from core import fonts, paths
 from core.version import APP_TITLE, __version__
 from core.history import (
     AddItemCommand,
     ClearPageCommand,
+    GroupItemsCommand,
     RemoveItemsCommand,
+    UngroupItemsCommand,
+    push_commands,
 )
 from core.page import BoardPage
 from core.settings import AppSettings
@@ -253,6 +256,9 @@ class MainWindow(QMainWindow):
                                 self.delete_selected, "trash")
         e["clear"] = self._act("清空当前页", "Ctrl+Shift+Backspace",
                                self.clear_current_page, "trash")
+        e["group"] = self._act("组合", "Ctrl+G", self.group_selected, "group")
+        e["ungroup"] = self._act("取消组合", "Ctrl+Shift+G",
+                                 self.ungroup_selected, "ungroup")
         e["sep"] = None
 
         g["add"] = self._act("新建页面", "Ctrl+T", self.add_page, "page")
@@ -306,6 +312,8 @@ class MainWindow(QMainWindow):
         m.addAction(em["undo"]); m.addAction(em["redo"])
         m.addSeparator()
         m.addAction(em["delete"]); m.addAction(em["clear"])
+        m.addSeparator()
+        m.addAction(em["group"]); m.addAction(em["ungroup"])
 
         p = self.menuBar().addMenu("页面(&P)")
         pm = self._page_menu_actions
@@ -484,6 +492,9 @@ class MainWindow(QMainWindow):
                                    Qt.ConnectionType.UniqueConnection)
         stack.cleanChanged.connect(self._on_clean_changed,
                                    Qt.ConnectionType.UniqueConnection)
+        # 选中变化会影响「组合/取消组合」是否可用
+        page.scene.selectionChanged.connect(self._update_edit_actions,
+                                            Qt.ConnectionType.UniqueConnection)
         self.view.undo_stack = stack
 
     def _bind_pages(self, pages) -> None:
@@ -848,6 +859,58 @@ class MainWindow(QMainWindow):
         self.undo_stack.push(
             RemoveItemsCommand(scene, items, f"删除 {len(items)} 个对象"))
 
+    # --------------------------------------------------------- 组合 / 取消组合
+    def group_selected(self) -> None:
+        """把选中的对象组合成一个整体（Ctrl+G）。"""
+        scene = self.view.scene()
+        items = [it for it in scene.selectedItems()
+                 if not it.parentItem() and not isinstance(it, GroupItem)]
+        if len(items) < 2:
+            self.statusBar().showMessage(
+                "请先选中至少两个对象（Ctrl+点击可多选），再按 Ctrl+G 组合", 4000)
+            return
+        command = GroupItemsCommand(scene, items)
+        self.undo_stack.push(command)
+        group = command.group()
+        scene.clearSelection()
+        if group is not None and group.scene() is scene:
+            group.setSelected(True)
+        self.statusBar().showMessage(
+            f"已组合 {len(items)} 个对象（Ctrl+Shift+G 可取消组合，可拖动/缩放整体）", 4000)
+
+    def ungroup_selected(self) -> None:
+        """拆开选中的组合（Ctrl+Shift+G）。"""
+        scene = self.view.scene()
+        groups = [it for it in scene.selectedItems() if isinstance(it, GroupItem)]
+        if not groups:
+            self.statusBar().showMessage("请先选中一个组合，再按 Ctrl+Shift+G 取消组合", 4000)
+            return
+        commands = [UngroupItemsCommand(scene, group) for group in groups]
+        push_commands(self.undo_stack, "取消组合", commands)
+        scene.clearSelection()
+        for command in commands:
+            for item in command.items():
+                if item.scene() is scene:
+                    item.setSelected(True)
+        self.statusBar().showMessage(f"已取消 {len(groups)} 个组合", 3000)
+
+    def _update_edit_actions(self) -> None:
+        """根据当前选中情况启用/禁用「组合」「取消组合」（并给出悬浮提示）。"""
+        scene = self.view.scene()
+        actions = getattr(self, "_edit_menu_actions", None)
+        if not scene or not actions:
+            return
+        selected = [it for it in scene.selectedItems() if it.isVisible()]
+        groupable = [it for it in selected
+                     if not it.parentItem() and not isinstance(it, GroupItem)]
+        groups = [it for it in selected if isinstance(it, GroupItem)]
+        actions["group"].setEnabled(len(groupable) >= 2)
+        actions["ungroup"].setEnabled(bool(groups))
+        actions["group"].setToolTip(
+            "把选中的多个对象组合成一个整体（Ctrl+G）：可整体选中/移动/自由缩放"
+            + ("" if len(groupable) >= 2 else "——当前选中不足两个对象"))
+        actions["ungroup"].setToolTip("拆开选中的组合（Ctrl+Shift+G）")
+
     def clear_current_page(self) -> None:
         scene = self.view.scene()
         if not scene.items():
@@ -1043,8 +1106,9 @@ class MainWindow(QMainWindow):
             f"{APP_TITLE} {__version__}\n"
             "基于 PySide6 / Qt Graphics View 的个人白板\n\n"
             "画笔 · 橡皮（擦断）· 11 种形状 · 文字（可导入字体）\n"
-            "选择/框选 · 拖动画布 · 多页面 · 撤销重做\n"
-            ".wbd 文件 · PNG 导出 · 导入图片 · 自动保存\n\n"
+            "选择/框选 · 组合（Ctrl+G）· 自由伸缩 · 拖动画布\n"
+            "多页面 · 撤销重做 · .wbd 文件 · PNG 导出 · 导入图片/拖拽文件\n"
+            "自动保存 · 深浅主题\n\n"
             "滚轮缩放 · 空格/中键或「拖动」工具平移\n\n"
             f"配置文件：{self.settings.location}\n"
             f"字体目录：{fonts.fonts_directory(create=False)}")
@@ -1056,9 +1120,10 @@ class MainWindow(QMainWindow):
             "Ctrl+S 保存 · Ctrl+Shift+S 另存为\n"
             "Ctrl+O 打开 · Ctrl+E 导出 PNG · Ctrl+I 导入图片\n"
             "Ctrl+T 新建页面 · Ctrl+Shift+D 删除当前页\n"
+            "Ctrl+G 组合 · Ctrl+Shift+G 取消组合\n"
             "PgUp/PgDn 切换页面 · Delete 删除选中\n"
             "+ / - 缩放 · Ctrl+0 适应窗口 · Ctrl+1 实际大小\n"
             "空格/中键拖拽 = 平移画布\n\n"
             "选择工具下双击文字 = 编辑内容与字体/字号/换行\n"
-            "选中图片/文字后拖手柄 = 自由伸缩\n\n"
+            "选中图片/文字/图形/笔迹/组合后拖手柄 = 自由伸缩\n\n"
             "把图片拖进窗口 = 导入到落点；把 .wbd 拖进窗口 = 追加为新页面")

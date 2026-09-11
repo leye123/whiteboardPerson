@@ -224,6 +224,79 @@ class ResizeItemCommand(QUndoCommand):
         self._apply(self._old)
 
 
+# ------------------------------------------------------------------ 组合
+
+
+class GroupItemsCommand(QUndoCommand):
+    """把若干图形项组合成一个整体（Ctrl+G，可撤销）。
+
+    组只建一次：``undo`` 把子项放回场景、``redo`` 再收回来。
+    ``QGraphicsItemGroup`` 的成员增删**会自己保持子项的场景外观**
+    （位置与缩放都补偿好），所以这里不用手动换算坐标。
+    """
+
+    def __init__(self, scene, items: Sequence, text: str = "组合", parent=None) -> None:
+        super().__init__(text, parent)
+        self._scene = scene
+        self._items = top_level_items(items)
+        self._z = {it: it.zValue() for it in self._items}
+        self._group = None
+
+    def group(self):
+        """本次命令创建的组（供界面在组合后选中它）。"""
+        return self._group
+
+    def redo(self) -> None:
+        if self._group is None:
+            from canvas.items import GroupItem
+
+            self._group = GroupItem(self._items)
+            if self._items:
+                # 组整体排在选中项里最高的那一层，免得被下面的东西盖住
+                self._group.setZValue(max(self._z.values()))
+        for item in self._items:
+            self._group.add_item(item)
+        if self._group.scene() is not self._scene:
+            self._scene.addItem(self._group)
+
+    def undo(self) -> None:
+        if self._group is None:
+            return
+        for item in list(self._group.children_items()):
+            self._group.remove_item(item)
+        if self._group.scene() is self._scene:
+            self._scene.removeItem(self._group)
+        for item, z in self._z.items():
+            if item.scene() is self._scene:
+                item.setZValue(z)
+
+
+class UngroupItemsCommand(QUndoCommand):
+    """拆开一个组合（Ctrl+Shift+G，可撤销）。"""
+
+    def __init__(self, scene, group, text: str = "取消组合", parent=None) -> None:
+        super().__init__(text, parent)
+        self._scene = scene
+        self._group = group
+        self._items = list(group.children_items())
+
+    def items(self) -> list:
+        """组里的成员（供界面在拆开后重新选中它们）。"""
+        return list(self._items)
+
+    def redo(self) -> None:
+        for item in list(self._items):
+            self._group.remove_item(item)
+        if self._group.scene() is self._scene:
+            self._scene.removeItem(self._group)
+
+    def undo(self) -> None:
+        for item in self._items:
+            self._group.add_item(item)
+        if self._group.scene() is not self._scene:
+            self._scene.addItem(self._group)
+
+
 # ------------------------------------------------------------------ 工具函数
 
 

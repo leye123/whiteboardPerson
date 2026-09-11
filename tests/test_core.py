@@ -34,6 +34,7 @@ from PySide6.QtGui import (  # noqa: E402
     QPainter,
     QPainterPath,
     QPixmap,
+    QTransform,
     QUndoStack,
 )
 from PySide6.QtWidgets import QApplication  # noqa: E402
@@ -1179,6 +1180,158 @@ def test_text_resize_scales_font_size():
     assert item.pos() == QPointF(10.0, 20.0)
     item.restore_resize_state(state)
     assert item.font().pixelSize() == state["pixel_size"]
+
+
+def test_shapes_and_strokes_are_resizable():
+    """矩形/椭圆/多边形/线段/笔迹都能拖手柄缩放（和图片、文字一样）。"""
+    from canvas.items import PolygonShapeItem
+    from canvas.resize import BOTTOM_RIGHT, RIGHT
+
+    # 矩形：改几何、线宽不变、圆角按比例
+    rect = RectItem(QRectF(0.0, 0.0, 100.0, 60.0), QColor(0, 0, 0), 4.0, radius=8.0)
+    assert rect.is_resizable()
+    pen_before = rect.pen().widthF()
+    rect.resize_with(RIGHT, QPointF(200.0, 30.0))
+    assert abs(rect.rect().width() - 200.0) < 0.5
+    assert abs(rect.rect().height() - 60.0) < 0.5
+    assert abs(rect.pen().widthF() - pen_before) < 1e-6, "缩放形状不该改线宽"
+    assert rect.radius_value() > 8.0, "圆角半径应当按比例放大"
+    state = rect.resize_state()
+    rect.resize_with(RIGHT, QPointF(400.0, 30.0))
+    assert rect.rect().width() > 300.0
+    rect.restore_resize_state(state)
+    assert abs(rect.rect().width() - 200.0) < 0.5, "缩放状态可回滚（撤销用）"
+
+    # 椭圆 / 多边形：同样按几何缩放，且能无损往返
+    ellipse = EllipseItem(QRectF(0.0, 0.0, 80.0, 40.0), QColor(0, 0, 0), 2.0)
+    ellipse.resize_with(BOTTOM_RIGHT, QPointF(160.0, 80.0))
+    assert abs(ellipse.rect().width() - 160.0) < 0.5
+    polygon = PolygonShapeItem("star", QRectF(0.0, 0.0, 100.0, 100.0),
+                               QColor(0, 0, 0), 2.0)
+    polygon.resize_with(BOTTOM_RIGHT, QPointF(200.0, 200.0))
+    assert abs(polygon.rect().width() - 200.0) < 0.5
+    assert _roundtrip(polygon).to_dict() == polygon.to_dict()
+
+    # 线段：端点跟着缩放；水平线只改长度，不会被画笔余量带偏
+    line = LineItem(QPointF(0.0, 0.0), QPointF(100.0, 0.0), QColor(0, 0, 0), 2.0)
+    line.resize_with(RIGHT, QPointF(200.0, 0.0))
+    assert abs(line.end().x() - 200.0) < 0.5 and abs(line.end().y()) < 1e-6
+    assert abs(line.start().x()) < 0.5, "拖右边手柄时左端点不动"
+    diagonal = LineItem(QPointF(0.0, 0.0), QPointF(100.0, 100.0),
+                        QColor(0, 0, 0), 2.0)
+    diagonal.resize_with(BOTTOM_RIGHT, QPointF(200.0, 200.0), keep_aspect=True)
+    assert abs(diagonal.end().x() - 200.0) < 0.5
+    assert abs(diagonal.end().y() - 200.0) < 0.5
+
+    # 笔迹：走 transform（线宽跟着放大），状态可回滚
+    stroke = StrokeItem([QPointF(0.0, 0.0), QPointF(50.0, 30.0),
+                         QPointF(100.0, 0.0)], QColor(0, 0, 0), 2.0)
+    assert stroke.is_resizable()
+    before = stroke.resize_rect()
+    stroke.resize_with(BOTTOM_RIGHT, QPointF(before.right() + 100.0,
+                                             before.bottom() + 60.0),
+                       keep_aspect=False)
+    assert stroke.scene_scale() > 1.5
+    assert stroke.resize_rect().width() > before.width() * 1.5
+    stroke_state = stroke.resize_state()
+    stroke.restore_resize_state({"sx": 1.0, "sy": 1.0, "pos": [0.0, 0.0]})
+    assert abs(stroke.scene_scale() - 1.0) < 0.01
+    stroke.restore_resize_state(stroke_state)
+    # 注意 scene_scale() 是缩放倍数的几何平均，非等比缩放时不等于 sx
+    assert abs(stroke.transform().m11() - stroke_state["sx"]) < 0.01
+    assert abs(stroke.transform().m22() - stroke_state["sy"]) < 0.01
+
+
+def test_eraser_works_on_scaled_stroke():
+    """缩放过的笔迹也能正确擦断：圆心换算到局部坐标、碎片继承缩放。"""
+    from tools.eraser_tool import EraserTool
+
+    points = [QPointF(float(index) * 4.0, 0.0) for index in range(60)]   # 0..236
+    stroke = StrokeItem(points, QColor(0, 0, 0), 2.0)
+    stroke.setTransform(QTransform.fromScale(2.0, 2.0))                  # 放大 2 倍
+    scene = WhiteboardScene()
+    scene.addItem(stroke)
+
+    tool = EraserTool()
+    # 场景坐标 x=240 -> 局部 120；橡皮半径 8（场景）-> 局部 4
+    tool._split_stroke(stroke, QPointF(240.0, 0.0), 8.0, scene)
+    assert len(tool._added) == 2, "缩放后的笔迹也该被擦成两段"
+    for segment in tool._added:
+        assert abs(segment.scene_scale() - 2.0) < 0.01, "碎片要继承缩放"
+    fragments = sorted(tool._added, key=lambda it: it.points()[0].x())
+    assert fragments[0].points()[-1].x() * 2.0 < 240.0
+    assert fragments[1].points()[0].x() * 2.0 > 240.0
+    # 擦除位置应当就在圆心两侧，而不是跑到笔迹开头
+    assert fragments[0].points()[0].x() == 0.0, "前半段仍然从笔迹起点开始"
+
+
+def test_group_command_and_serialization():
+    """组合：整体命中/移动/缩放，可撤销，能存能读。"""
+    from canvas.items import GroupItem
+    from canvas.resize import BOTTOM_RIGHT
+    from core.history import GroupItemsCommand, UngroupItemsCommand
+
+    scene = WhiteboardScene()
+    stack = QUndoStack()
+    a = RectItem(QRectF(0.0, 0.0, 100.0, 60.0), QColor(0, 0, 0), 2.0)
+    b = RectItem(QRectF(200.0, 100.0, 80.0, 80.0), QColor(0, 0, 0), 2.0)
+    scene.addItem(a)
+    scene.addItem(b)
+    probe = a.sceneBoundingRect().center()
+
+    command = GroupItemsCommand(scene, [a, b])
+    stack.push(command)
+    group = command.group()
+    assert group is not None and group.scene() is scene
+    assert a.parentItem() is group and b.parentItem() is group
+    assert len(group.children_items()) == 2
+    assert group.is_resizable()
+    # 命中测试返回整组（成员不再被单独选中）
+    assert scene.topmost_item_at(probe) is group
+    group.setSelected(True)
+    assert scene.selectedItems() == [group]
+
+    # 整体缩放：成员跟着变
+    before = group.resize_rect()
+    group.resize_with(BOTTOM_RIGHT, QPointF(before.right() + 120.0,
+                                            before.bottom() + 90.0),
+                      keep_aspect=False)
+    assert group.resize_rect().width() > before.width() * 1.2
+    assert group.scene_scale() > 1.1
+
+    # 序列化：组合与成员都要完整保留
+    data = group.to_dict()
+    assert data["type"] == "group" and len(data["items"]) == 2
+    clone = item_from_dict(data)
+    assert clone.to_dict() == data
+    assert len(clone.children_items()) == 2
+    assert abs(clone.scene_scale() - group.scene_scale()) < 0.001
+    # 页面级往返（.wbd 保存/读取走的就是这条）
+    page = BoardPage("含组合的页")
+    page.scene.addItem(item_from_dict(data))
+    text = serializer.serialize_document([page], 0)
+    pages2, _cur = serializer.deserialize_document(text)
+    reloaded = [it for it in pages2[0].scene.items() if isinstance(it, GroupItem)]
+    assert len(reloaded) == 1 and len(reloaded[0].children_items()) == 2
+
+    # 撤销：成员回到场景、组合移出；重做：再收回来
+    scale_before_undo = group.scene_scale()
+    stack.undo()
+    assert group.scene() is None and a.parentItem() is None and a.scene() is scene
+    stack.redo()
+    assert a.parentItem() is group and group.scene() is scene
+    assert abs(group.scene_scale() - scale_before_undo) < 0.001
+
+    # 拆组命令 + 撤销（撤销 = 重新组合）
+    rect_before = a.sceneBoundingRect()
+    ungroup = UngroupItemsCommand(scene, group)
+    stack.push(ungroup)
+    assert a.parentItem() is None and group.scene() is None
+    now = a.sceneBoundingRect()
+    assert abs(now.width() - rect_before.width()) < 0.5, "拆组后外观不变"
+    stack.undo()
+    assert a.parentItem() is group and group.scene() is scene
+    assert abs(a.sceneBoundingRect().width() - rect_before.width()) < 0.5
 
 
 # ------------------------------------------------------------------ 运行器
